@@ -63,12 +63,77 @@ Anything else works through `--tagger`, which receives the prompt on stdin:
 yt2md <url> --tagger "llm -m gpt-4o-mini"
 ```
 
-## Install
+## Setup
+
+### 1. Install yt-dlp
+
+The only hard dependency. Pick whichever fits your system:
 
 ```bash
-curl -o ~/.local/bin/yt2md https://raw.githubusercontent.com/pedrosatin/yt2md/main/yt2md
-chmod +x ~/.local/bin/yt2md
+sudo pacman -S yt-dlp          # Arch
+sudo apt install yt-dlp        # Debian / Ubuntu
+brew install yt-dlp            # macOS
+pipx install yt-dlp            # anywhere with Python
 ```
+
+Check it:
+
+```bash
+yt-dlp --version
+python3 --version              # needs 3.9 or newer
+```
+
+### 2. Clone and link
+
+```bash
+git clone https://github.com/pedrosatin/yt2md.git ~/Work/yt2md
+chmod +x ~/Work/yt2md/yt2md
+mkdir -p ~/.local/bin
+ln -sf ~/Work/yt2md/yt2md ~/.local/bin/yt2md
+```
+
+A symlink, not a copy: `git pull` in the clone updates the command with no
+reinstall step. Copy the file instead if you would rather pin a version.
+
+### 3. Put `~/.local/bin` on your PATH
+
+Skip this if `echo $PATH` already contains it.
+
+```bash
+echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc   # or ~/.zshrc
+exec $SHELL
+```
+
+### 4. Verify
+
+```bash
+command -v yt2md                              # -> ~/.local/bin/yt2md
+yt2md --help
+yt2md https://youtu.be/jNQXAC9IVRw --stdout --no-tags | head
+```
+
+The last command is a 19-second video and exercises the whole pipeline without
+touching an LLM. If it prints Markdown, the setup is done.
+
+### 5. Tagging (optional)
+
+`tags:` needs one of the LLM CLIs listed under [Dependencies](#dependencies) on
+your `PATH`. The default is `claude`:
+
+```bash
+claude --version               # already installed? nothing else to do
+yt2md <url> -o ~/videos        # tags come from claude -p --model haiku
+```
+
+If you have a different one, say so once per run:
+
+```bash
+yt2md <url> --tag-harness codex
+yt2md <url> --tag-harness ollama --tag-model llama3.2
+```
+
+No LLM CLI at all? Use `--no-tags` and the file is written with `tags: []`.
+A tagging failure never loses the transcript - it warns and saves anyway.
 
 ## Usage
 
