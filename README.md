@@ -66,7 +66,7 @@ yt2md <url> --tagger "llm -m gpt-4o-mini"
 ## Install
 
 ```bash
-curl -o ~/.local/bin/yt2md https://raw.githubusercontent.com/satinP/yt2md/main/yt2md
+curl -o ~/.local/bin/yt2md https://raw.githubusercontent.com/pedrosatin/yt2md/main/yt2md
 chmod +x ~/.local/bin/yt2md
 ```
 
@@ -132,7 +132,7 @@ The vocabulary is a plain text file - edit it freely.
 
 ## Knowledge base
 
-The frontmatter matches what [graphify](https://github.com/graphify) reads: it
+The frontmatter matches what [graphify](https://github.com/safishamsi/graphify) reads: it
 copies `source_url`, `captured_at` and `author` onto every node extracted from
 the file. Because only the body below the `---` is hashed for its cache, editing
 frontmatter afterwards (fixing a tag, marking something reviewed) does not
