@@ -1,0 +1,477 @@
+#!/usr/bin/env python3
+"""yt2md - download a YouTube transcript and save it as '<title>.md'.
+
+Usage:
+    yt2md <url> [<url>...] [-l LANG] [-o DIR] [--stdout] [--keep-timestamps]
+
+Defaults to the video's original language. Asking for a different one makes
+YouTube generate a translation on demand, which is slow and frequently 429s.
+
+Requires: yt-dlp on PATH.
+"""
+
+import argparse
+import json
+import random
+import re
+import shlex
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+from datetime import datetime, timezone
+from pathlib import Path
+
+UA = ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+      "(KHTML, like Gecko) Chrome/128.0 Safari/537.36")
+MAX_RETRIES = 5
+
+# Silence (in seconds) between cues that triggers a paragraph break.
+PARAGRAPH_GAP = 2.5
+# Rough character budget before forcing a paragraph break.
+PARAGRAPH_CHARS = 700
+
+
+QUIET = False
+
+
+def step(msg, t0=None):
+    """Progress on stderr, so stdout stays clean for --stdout."""
+    if QUIET:
+        return
+    suffix = f" ({time.perf_counter() - t0:.1f}s)" if t0 else ""
+    print(f"{msg}{suffix}", file=sys.stderr, flush=True)
+
+
+def run(cmd):
+    return subprocess.run(cmd, capture_output=True, text=True, check=False)
+
+
+def sanitize(name):
+    """Turn a video title into a safe filename."""
+    name = re.sub(r'[/\\:*?"<>|\n\r\t]', " ", name)
+    name = re.sub(r"\s+", " ", name).strip().strip(".")
+    return name[:180] or "video"
+
+
+# Accumulated tag vocabulary. Without it every video invents a fresh label
+# ('tdd', 'test-driven-development', 'testing') and the corpus turns to noise.
+TAG_VOCAB = Path.home() / ".config" / "yt2md" / "tags.txt"
+TAG_PROMPT = """You are given a video transcript. Reply with ONE line only:
+3 to 7 topical tags, comma-separated, lowercase, kebab-case, in English.
+
+Tags already used in this knowledge base (REUSE them when they fit, instead of
+inventing a synonym):
+{known}
+
+Rules: themes and concepts, not frequent words. No channel name, no speaker
+name, no "video", "interview", "podcast". No explanation, no markdown, just the
+one line.
+
+Title: {title}
+Channel: {channel}
+
+Transcript:
+{body}"""
+
+
+# How to invoke each CLI headlessly. 'prompt' says whether the text goes on
+# stdin or as an argument - gemini only accepts the prompt via -p.
+HARNESSES = {
+    "claude": {
+        "build": lambda m: ["claude", "-p"] + (["--model", m] if m else []),
+        "prompt": "stdin", "model": "haiku",
+    },
+    # Without --skip-git-repo-check, codex refuses to run outside a trusted repo.
+    "codex": {
+        "build": lambda m: (["codex", "exec", "--skip-git-repo-check"]
+                            + (["-m", m] if m else []) + ["-"]),
+        "prompt": "stdin", "model": None,
+    },
+    "opencode": {
+        "build": lambda m: ["opencode", "run"] + (["-m", m] if m else []),
+        "prompt": "stdin", "model": None,
+    },
+    # --skip-trust is gemini's equivalent of the above.
+    "gemini": {
+        "build": lambda m: ["gemini", "--skip-trust"] + (["-m", m] if m else []) + ["-p"],
+        "prompt": "argv", "model": None,
+    },
+    "ollama": {
+        "build": lambda m: ["ollama", "run", m],
+        "prompt": "stdin", "model": "llama3.2",
+    },
+}
+
+# opencode (among others) colors its output; without stripping it the first tag
+# comes out as '\x1b[0mtag'.
+ANSI = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
+
+
+def suggest_tags(title, channel, body, harness, model, custom):
+    """Ask a local LLM CLI for tags. Never brings the transcript down."""
+    known = []
+    if TAG_VOCAB.exists():
+        known = [l.strip() for l in TAG_VOCAB.read_text(encoding="utf-8").splitlines()
+                 if l.strip()]
+
+    prompt = TAG_PROMPT.format(
+        known=", ".join(known) or "(none yet)",
+        title=title, channel=channel, body=body[:40000])
+    if custom:
+        argv, via_stdin = shlex.split(custom), True
+    else:
+        cfg = HARNESSES[harness]
+        argv = cfg["build"](model or cfg["model"])
+        via_stdin = cfg["prompt"] == "stdin"
+    if not via_stdin:
+        argv = argv + [prompt]
+
+    try:
+        r = subprocess.run(argv, input=prompt if via_stdin else None,
+                           capture_output=True, text=True, timeout=300)
+    except (OSError, subprocess.SubprocessError) as e:
+        step(f"      tags skipped ({e})")
+        return []
+    if r.returncode != 0:
+        # Skip stack frames: the real cause usually comes before them.
+        err = [l.strip() for l in ANSI.sub("", r.stderr or "").splitlines()
+               if l.strip() and not l.strip().startswith("at ")]
+        step(f"      tags skipped: {argv[0]} exited {r.returncode}"
+             f"{' - ' + err[-1][:120] if err else ''}")
+        return []
+
+    # Take only the last non-empty line, in case the model writes something first.
+    out = ANSI.sub("", r.stdout)
+    lines = [l for l in out.strip().splitlines() if l.strip()]
+    if not lines:
+        return []
+    tags = []
+    for chunk in lines[-1].split(","):
+        t = re.sub(r"[^a-z0-9\- ]", "", chunk.strip().lower()).strip()
+        t = re.sub(r"[\s_]+", "-", t).strip("-")
+        if 2 < len(t) <= 40 and t not in tags:
+            tags.append(t)
+    tags = tags[:7]
+
+    fresh = [t for t in tags if t not in known]
+    if fresh:
+        TAG_VOCAB.parent.mkdir(parents=True, exist_ok=True)
+        with TAG_VOCAB.open("a", encoding="utf-8") as f:
+            f.write("".join(f"{t}\n" for t in fresh))
+    return tags
+
+
+def yaml_str(value):
+    """Escape a value so it fits inside a double-quoted YAML scalar."""
+    return str(value).replace("\\", "\\\\").replace('"', '\\"')
+
+
+def probe(url, cookies_from):
+    """Return yt-dlp's metadata dict (a single network call)."""
+    cmd = ["yt-dlp", "--no-warnings", "-J", "--skip-download"]
+    if cookies_from:
+        cmd += ["--cookies-from-browser", cookies_from]
+    r = run(cmd + [url])
+    if r.returncode != 0:
+        raise RuntimeError(r.stderr.strip().splitlines()[-1] if r.stderr else "yt-dlp failed")
+    return json.loads(r.stdout)
+
+
+def pick_track(info, override):
+    """Pick the subtitle track, preferring the video's original language.
+
+    Returns (lang, json3_url). Anything other than the original is a
+    translation YouTube generates on demand - expensive, and the main source
+    of HTTP 429.
+    """
+    manual = info.get("subtitles") or {}
+    auto = info.get("automatic_captions") or {}
+    guessed = False
+
+    # With no override we want the real speech, never a machine translation:
+    # YouTube marks translated tracks with 'tlang=' in the track URL.
+    allow_translated = bool(override)
+
+    def url_for(lang):
+        for src in (manual, auto):
+            for fmt in src.get(lang) or []:
+                if fmt.get("ext") != "json3" or not fmt.get("url"):
+                    continue
+                if not allow_translated and "tlang=" in fmt["url"]:
+                    continue
+                return fmt["url"]
+        return None
+
+    pool = manual | auto
+
+    def expand(lang):
+        """'en-US' -> ['en-US-orig', 'en-US', 'en-orig', 'en', ...] that exist.
+
+        The '-orig' variants come first: on a video with dubbed audio they are
+        the transcript of the original audio, while the plain code may be a
+        translation.
+        """
+        base = lang.split("-")[0].lower()
+        seen = list(dict.fromkeys(
+            c for c in (f"{lang}-orig", lang, f"{base}-orig", base) if c in pool))
+        seen += [l for l in sorted(pool)
+                 if l.split("-")[0].lower() == base and l not in seen]
+        return seen
+
+    if override:
+        cands = expand(override)
+    elif info.get("language"):
+        cands = expand(info["language"])
+    elif len(manual) == 1:
+        cands = list(manual)
+    else:
+        # A single '*-orig' identifies the original; several mean dubbed audio
+        # tracks (YouTube marks every dub), so they tell us nothing.
+        origs = [l for l in auto if l.endswith("-orig")]
+        if len(origs) == 1:
+            cands = expand(origs[0].removesuffix("-orig"))
+        else:
+            # Nothing identifies the language: use the first listed track and
+            # warn, rather than failing - YouTube tends to list the main one first.
+            order = list(manual) or list(auto)
+            cands = expand(order[0]) if order else []
+            guessed = True
+
+    for lang in cands:
+        u = url_for(lang)
+        if u:
+            chosen = lang.removesuffix("-orig")
+            if guessed:
+                step(f"      video declares no language; using '{chosen}' "
+                     f"(pass -l to choose another)")
+            return chosen, u
+
+    target = override or info.get("language") or "original language"
+    raise RuntimeError(
+        f"no json3 subtitles for '{target}' "
+        f"(manual: {', '.join(sorted(manual)) or 'none'}; "
+        f"{len(auto)} automatic)")
+
+
+def fetch(url):
+    """Download the subtitle track with exponential backoff - YouTube 429s easily."""
+    delay = 2.0
+    for attempt in range(MAX_RETRIES):
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": UA})
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                return resp.read().decode("utf-8", "replace")
+        except urllib.error.HTTPError as e:
+            if e.code not in (429, 500, 503) or attempt == MAX_RETRIES - 1:
+                raise RuntimeError(f"HTTP {e.code} while downloading subtitles") from e
+            wait = float(e.headers.get("Retry-After") or 0) or delay
+            step(f"      HTTP {e.code}, retrying in {wait:.0f}s "
+                 f"({attempt + 1}/{MAX_RETRIES})")
+            time.sleep(wait + random.uniform(0, 1))
+            delay *= 2
+        except urllib.error.URLError as e:
+            if attempt == MAX_RETRIES - 1:
+                raise RuntimeError(f"network error: {e.reason}") from e
+            time.sleep(delay)
+            delay *= 2
+    raise RuntimeError("failed to download subtitles")
+
+
+# Closed-caption sound annotations: [Laughter], [MUSIC], (APPLAUSE), music notes.
+SOUND_BRACKET = re.compile(r"\[[^\]]{0,60}\]")
+SOUND_PAREN = re.compile(r"\((?:[^a-z()]{2,40})\)")  # parentheses with no lowercase
+MUSIC_NOTE = re.compile(r"[♪♫♪-♯]")
+# '>>' / '>>>' mark a speaker change, optionally followed by 'NAME:'.
+SPEAKER_MARK = re.compile(r">>+\s*")
+SPEAKER_NAME = re.compile(r"^([^\s:][^:]{0,40}):\s+(?=\S)")
+
+
+def clean_text(text, keep_sound_tags):
+    """Strip closed-caption annotations while preserving the speech."""
+    if not keep_sound_tags:
+        text = SOUND_BRACKET.sub(" ", text)
+        text = SOUND_PAREN.sub(" ", text)
+        text = MUSIC_NOTE.sub(" ", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def parse_json3(raw, keep_sound_tags):
+    """Extract cleaned [(start, end, text, new_speaker)] from json3.
+
+    One cue can hold several speaker changes ('>>'), so it is split into
+    several chunks - each '>>' opens a new one.
+    """
+    data = json.loads(raw)
+    cues = []
+    for ev in data.get("events", []):
+        # 'aAppend' events repeat the previous line in the rolling effect of
+        # auto-captions - dropping them is what removes the duplication.
+        if ev.get("aAppend") or "segs" not in ev:
+            continue
+        raw_text = "".join(s.get("utf8", "") for s in ev["segs"]).replace("\n", " ")
+        start = ev.get("tStartMs", 0) / 1000.0
+        end = start + ev.get("dDurationMs", 0) / 1000.0
+
+        parts = SPEAKER_MARK.split(raw_text)
+        # If the cue starts with '>>' the first chunk is empty: the marker
+        # applies to what follows, not to the text before it.
+        for i, part in enumerate(parts):
+            txt = clean_text(part, keep_sound_tags)
+            if txt:
+                cues.append((start, end, txt, i > 0))
+    return cues
+
+
+def format_speaker(text):
+    """Turn 'NAME: speech' into '**NAME:** speech'."""
+    m = SPEAKER_NAME.match(text)
+    if m and len(m.group(1).split()) <= 4:
+        return f"**{m.group(1).strip()}:** {text[m.end():]}"
+    return text
+
+
+def to_markdown(cues, keep_timestamps):
+    if keep_timestamps:
+        return "\n".join(
+            f"[{int(t) // 3600:02d}:{int(t) // 60 % 60:02d}:{int(t) % 60:02d}] "
+            f"{format_speaker(txt) if new else txt}"
+            for t, _end, txt, new in cues
+        )
+
+    paragraphs, buf, prev_end = [], [], None
+    for start, end, txt, new_speaker in cues:
+        too_long = sum(len(x) for x in buf) > PARAGRAPH_CHARS
+        # Real silence between the end of the previous cue and the start of this one.
+        gap = prev_end is not None and start - prev_end > PARAGRAPH_GAP
+        if buf and (new_speaker or gap or too_long):
+            paragraphs.append(" ".join(buf))
+            buf = []
+        buf.append(format_speaker(txt) if new_speaker and not buf else txt)
+        prev_end = max(end, prev_end or 0)
+    if buf:
+        paragraphs.append(" ".join(buf))
+
+    return "\n\n".join(p for p in (re.sub(r"\s+", " ", x).strip() for x in paragraphs) if p)
+
+
+def build_document(title, channel, vid, lang, tags, body):
+    """Assemble the Markdown file, frontmatter first.
+
+    The frontmatter matches what graphify writes in ingest.py: it copies
+    source_url/captured_at/author onto every node extracted from the file, and
+    hashes only the body below the '---', so editing these fields later (tags,
+    reviewed flags) does not trigger a paid re-extraction.
+    """
+    return (
+        "---\n"
+        f'source_url: "{yaml_str(f"https://www.youtube.com/watch?v={vid}")}"\n'
+        "type: video\n"
+        f'title: "{yaml_str(title)}"\n'
+        f'author: "{yaml_str(channel)}"\n'
+        f"captured_at: {datetime.now(timezone.utc).isoformat(timespec='seconds')}\n"
+        f"video_id: {vid}\n"
+        f"subtitle_lang: {lang}\n"
+        f"tags: [{', '.join(tags)}]\n"
+        "---\n\n"
+        f"# {title}\n\n{body}\n"
+    )
+
+
+def process(url, args):
+    step(f"-> {url}")
+
+    t = time.perf_counter()
+    step("  1/4 fetching metadata...")
+    info = probe(url, args.cookies_from_browser)
+    title = info.get("title", "video")
+    channel = info.get("uploader", "")
+    vid = info.get("id", "")
+    step(f"      {title} - {channel}", t)
+
+    lang, sub_url = pick_track(info, args.lang)
+    t = time.perf_counter()
+    step(f"  2/4 downloading '{lang}' subtitles...")
+    cues = parse_json3(fetch(sub_url), args.keep_sound_tags)
+    if not cues:
+        raise RuntimeError("empty subtitles")
+    step(f"      {len(cues)} cues", t)
+
+    step("  3/4 assembling paragraphs...")
+    body = to_markdown(cues, args.keep_timestamps)
+    step(f"      {body.count(chr(10) * 2) + 1} paragraphs, {len(body.split())} words")
+
+    tags = []
+    if args.no_tags:
+        step("  4/4 tags disabled (--no-tags)")
+    else:
+        t = time.perf_counter()
+        model = (args.tag_model or HARNESSES[args.tag_harness]["model"]
+                 or "CLI default model")
+        via = args.tagger or f"{args.tag_harness} ({model})"
+        step(f"  4/4 generating tags via {via}...")
+        tags = suggest_tags(title, channel, body,
+                            args.tag_harness, args.tag_model, args.tagger)
+        step(f"      {', '.join(tags) or '(none)'}", t)
+
+    doc = build_document(title, channel, vid, lang, tags, body)
+
+    if args.stdout:
+        sys.stdout.write(doc)
+        return None
+
+    dest = Path(args.outdir).expanduser() / f"{sanitize(title)}.md"
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    dest.write_text(doc, encoding="utf-8")
+    return dest
+
+
+def main():
+    ap = argparse.ArgumentParser(description="YouTube transcript -> clean Markdown")
+    ap.add_argument("urls", nargs="+")
+    ap.add_argument("-l", "--lang", default=None,
+                    help="force a language (default: the video's original). "
+                         "Non-original languages are translations generated on "
+                         "demand and may 429")
+    ap.add_argument("-o", "--outdir", default=".", help="output directory (default: cwd)")
+    ap.add_argument("--stdout", action="store_true", help="print instead of saving")
+    ap.add_argument("--keep-timestamps", action="store_true", help="keep the timestamps")
+    ap.add_argument("--keep-sound-tags", action="store_true",
+                    help="keep annotations such as [Laughter], [Applause], music notes")
+    ap.add_argument("-q", "--quiet", action="store_true",
+                    help="do not print step progress")
+    ap.add_argument("--no-tags", action="store_true",
+                    help="skip tag generation (avoids the LLM call)")
+    ap.add_argument("--tag-harness", default="claude", choices=sorted(HARNESSES),
+                    help="CLI used to generate tags (default: claude)")
+    ap.add_argument("--tag-model", default=None, metavar="MODEL",
+                    help="model for tagging (default: haiku on claude; "
+                         "the CLI's own default elsewhere)")
+    ap.add_argument("--tagger", default=None, metavar="COMMAND",
+                    help="custom tagging command, receiving the prompt on stdin "
+                         "(e.g. 'llm -m gpt-4o-mini'). Overrides "
+                         "--tag-harness/--tag-model")
+    ap.add_argument("--cookies-from-browser", default=None, metavar="BROWSER",
+                    help="e.g. chrome, firefox - helps when YouTube rate-limits your IP")
+    args = ap.parse_args()
+
+    global QUIET
+    QUIET = args.quiet
+
+    failures = 0
+    for i, url in enumerate(args.urls):
+        if i:
+            time.sleep(1.5)  # space out batch requests to avoid 429
+        try:
+            dest = process(url, args)
+            if dest:
+                print(f"OK {dest}")
+        except Exception as e:  # noqa: BLE001
+            failures += 1
+            print(f"FAIL {url}: {e}", file=sys.stderr)
+    return 1 if failures else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
