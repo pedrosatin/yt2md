@@ -83,7 +83,23 @@ yt-dlp --version
 python3 --version              # needs 3.9 or newer
 ```
 
-### 2. Clone and link
+### 2. Get the script
+
+The whole tool is a single file, so downloading it is enough:
+
+```bash
+mkdir -p ~/.local/bin
+curl -fsSL -o ~/.local/bin/yt2md https://raw.githubusercontent.com/pedrosatin/yt2md/main/yt2md
+chmod +x ~/.local/bin/yt2md
+```
+
+To update later, run the same `curl` again.
+
+<details>
+<summary>Alternative: clone and symlink</summary>
+
+Better if you plan to edit the script or follow its history - `git pull` then
+updates the command with no reinstall step:
 
 ```bash
 git clone https://github.com/pedrosatin/yt2md.git ~/Work/yt2md
@@ -92,8 +108,7 @@ mkdir -p ~/.local/bin
 ln -sf ~/Work/yt2md/yt2md ~/.local/bin/yt2md
 ```
 
-A symlink, not a copy: `git pull` in the clone updates the command with no
-reinstall step. Copy the file instead if you would rather pin a version.
+</details>
 
 ### 3. Put `~/.local/bin` on your PATH
 
