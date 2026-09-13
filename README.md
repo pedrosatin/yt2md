@@ -138,7 +138,7 @@ your `PATH`. The default is `agy` (with `gemini-3.8-flash-high`):
 
 ```bash
 agy --version                  # already installed? nothing else to do
-yt2md <url> -o ~/videos        # tags come from agy -p --model gemini-3.8-flash-high
+yt2md <url> -o ~/videos        # tags come from agy --model gemini-3.8-flash-high -p
 ```
 
 #### Changing the default agent
@@ -148,9 +148,10 @@ You can change the default agent in any of these ways:
 1. **Persistently via CLI:**
    ```bash
    yt2md --set-harness claude                     # switch default harness to claude
-   yt2md --set-harness agy --set-model gemini-3.8-flash
+   yt2md --set-harness agy --set-model gemini-3.8-flash    # normalizes to gemini-3.8-flash-high
    yt2md --show-config                            # inspect current effective defaults
    ```
+   *(Note: For `agy`, Gemini models without explicit effort suffix are automatically normalized to `-high`.)*
 
 2. **Via config file (`~/.config/yt2md/config.json`):**
    ```json

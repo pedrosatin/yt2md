@@ -67,14 +67,14 @@ def resolve_agy_model(model):
     """Normalize model string for agy CLI.
 
     agy requires --effort (or a -high/-medium/-low suffix) for Gemini models.
-    If a model like 'gemini-3.8-flash' is requested without effort, default to '-high'.
+    If a Gemini model is requested without effort, default to '-high'.
     """
     if not model:
         return "gemini-3.8-flash-high"
     m = model.strip().lower().replace(" ", "-")
     if m in ("default", "cli-default"):
         return None
-    if m in ("gemini-3.8-flash", "gemini-3.7-flash", "gemini-3.6-flash", "gemini-3.1-pro"):
+    if m.startswith("gemini-") and not m.endswith(("-high", "-medium", "-low")):
         return f"{m}-high"
     return m
 
@@ -88,7 +88,9 @@ def load_config():
                 data = json.load(f)
                 if isinstance(data, dict):
                     cfg = data
-        except Exception as e:
+                else:
+                    step(f"warning: config file {CONFIG_FILE} does not contain a JSON object")
+        except (json.JSONDecodeError, OSError) as e:
             step(f"warning: failed to read config file {CONFIG_FILE}: {e}")
 
     # Aliases
@@ -109,21 +111,34 @@ def load_config():
 
 
 def save_config(updates):
-    """Save configuration key-value updates to ~/.config/yt2md/config.json."""
+    """Save configuration key-value updates to ~/.config/yt2md/config.json.
+
+    Refuses to overwrite an existing config file that cannot be read or parsed.
+    """
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     cfg = {}
     if CONFIG_FILE.exists():
         try:
             with CONFIG_FILE.open("r", encoding="utf-8") as f:
                 data = json.load(f)
-                if isinstance(data, dict):
-                    cfg = data
-        except Exception:
-            cfg = {}
+                if not isinstance(data, dict):
+                    print(f"error: config file {CONFIG_FILE} does not contain a JSON object; refusing to overwrite",
+                          file=sys.stderr)
+                    return False
+                cfg = data
+        except (json.JSONDecodeError, OSError) as e:
+            print(f"error: failed to read config file {CONFIG_FILE}: {e}; refusing to overwrite",
+                  file=sys.stderr)
+            return False
     cfg.update(updates)
-    with CONFIG_FILE.open("w", encoding="utf-8") as f:
-        json.dump(cfg, f, indent=2)
-        f.write("\n")
+    try:
+        with CONFIG_FILE.open("w", encoding="utf-8") as f:
+            json.dump(cfg, f, indent=2)
+            f.write("\n")
+        return True
+    except OSError as e:
+        print(f"error: failed to write config file {CONFIG_FILE}: {e}", file=sys.stderr)
+        return False
 
 
 TAG_PROMPT = """You are given a video transcript. Reply with ONE line only:
@@ -144,11 +159,16 @@ Transcript:
 {body}"""
 
 
+def _build_agy(m):
+    resolved = resolve_agy_model(m)
+    return ["agy"] + (["--model", resolved] if resolved else []) + ["-p"]
+
+
 # How to invoke each CLI headlessly. 'prompt' says whether the text goes on
 # stdin or as an argument - gemini only accepts the prompt via -p.
 HARNESSES = {
     "agy": {
-        "build": lambda m: ["agy"] + (["--model", resolve_agy_model(m)] if resolve_agy_model(m) else []) + ["-p"],
+        "build": _build_agy,
         "prompt": "argv", "model": "gemini-3.8-flash-high",
     },
     "claude": {
@@ -479,14 +499,13 @@ def process(url, args):
         step("  4/4 tags disabled (--no-tags)")
     else:
         t = time.perf_counter()
-        model = (args.tag_model or HARNESSES[args.tag_harness]["model"]
-                 or "CLI default model")
-        if args.tag_harness == "agy" and model != "CLI default model":
-            model = resolve_agy_model(model) or model
-        via = args.tagger or f"{args.tag_harness} ({model})"
+        raw_model = args.tag_model or HARNESSES[args.tag_harness]["model"]
+        model = resolve_agy_model(raw_model) if args.tag_harness == "agy" else raw_model
+        display_model = model or "CLI default model"
+        via = args.tagger or f"{args.tag_harness} ({display_model})"
         step(f"  4/4 generating tags via {via}...")
         tags = suggest_tags(title, channel, body,
-                            args.tag_harness, args.tag_model, args.tagger)
+                            args.tag_harness, model or raw_model, args.tagger)
         step(f"      {', '.join(tags) or '(none)'}", t)
 
     doc = build_document(title, channel, vid, lang, tags, body)
@@ -501,7 +520,13 @@ def process(url, args):
     return dest
 
 
-def main():
+def main(argv=None):
+    if argv is None:
+        argv = sys.argv[1:]
+
+    global QUIET
+    QUIET = any(arg in argv for arg in ("-q", "--quiet"))
+
     cfg = load_config()
     default_harness = cfg.get("tag_harness") or DEFAULT_HARNESS
     if default_harness not in HARNESSES:
@@ -544,19 +569,18 @@ def main():
                     help="save default tag harness to ~/.config/yt2md/config.json and exit")
     ap.add_argument("--set-model", metavar="MODEL",
                     help="save default tag model to ~/.config/yt2md/config.json and exit")
-    args = ap.parse_args()
+    args = ap.parse_args(argv)
 
-    global QUIET
     QUIET = args.quiet
 
     if args.show_config:
         print(f"Config file: {CONFIG_FILE} ({'found' if CONFIG_FILE.exists() else 'not created yet'})")
         print("Effective settings:")
         print(f"  tag_harness: {args.tag_harness}")
-        active_model = args.tag_model or HARNESSES.get(args.tag_harness, {}).get("model") or "(CLI default)"
-        if args.tag_harness == "agy" and active_model != "(CLI default)":
-            active_model = resolve_agy_model(active_model) or active_model
-        print(f"  tag_model:   {active_model}")
+        active_model = args.tag_model or HARNESSES.get(args.tag_harness, {}).get("model")
+        if args.tag_harness == "agy":
+            active_model = resolve_agy_model(active_model)
+        print(f"  tag_model:   {active_model or '(CLI default)'}")
         print(f"  tagger:      {args.tagger or '(none)'}")
         print(f"  outdir:      {args.outdir}")
         print("\nAvailable harnesses:")
@@ -574,7 +598,8 @@ def main():
             if (args.set_harness or args.tag_harness) == "agy":
                 model_val = resolve_agy_model(model_val) or model_val
             updates["tag_model"] = model_val
-        save_config(updates)
+        if not save_config(updates):
+            return 1
         for k, v in updates.items():
             print(f"Saved {k} = {v} in {CONFIG_FILE}")
         return 0
