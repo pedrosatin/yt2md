@@ -12,6 +12,7 @@ Requires: yt-dlp on PATH.
 
 import argparse
 import json
+import os
 import random
 import re
 import shlex
@@ -55,9 +56,91 @@ def sanitize(name):
     return name[:180] or "video"
 
 
-# Accumulated tag vocabulary. Without it every video invents a fresh label
-# ('tdd', 'test-driven-development', 'testing') and the corpus turns to noise.
-TAG_VOCAB = Path.home() / ".config" / "yt2md" / "tags.txt"
+# Configuration and accumulated tag vocabulary.
+CONFIG_DIR = Path.home() / ".config" / "yt2md"
+CONFIG_FILE = CONFIG_DIR / "config.json"
+TAG_VOCAB = CONFIG_DIR / "tags.txt"
+DEFAULT_HARNESS = "agy"
+
+
+def resolve_agy_model(model):
+    """Normalize model string for agy CLI.
+
+    agy requires --effort (or a -high/-medium/-low suffix) for Gemini models.
+    If a Gemini model is requested without effort, default to '-high'.
+    """
+    if not model:
+        return "gemini-3.8-flash-high"
+    m = model.strip().lower().replace(" ", "-")
+    if m in ("default", "cli-default"):
+        return None
+    if m.startswith("gemini-") and not m.endswith(("-high", "-medium", "-low")):
+        return f"{m}-high"
+    return m
+
+
+def load_config():
+    """Load configuration from ~/.config/yt2md/config.json and environment variables."""
+    cfg = {}
+    if CONFIG_FILE.exists():
+        try:
+            with CONFIG_FILE.open("r", encoding="utf-8") as f:
+                data = json.load(f)
+                if isinstance(data, dict):
+                    cfg = data
+                else:
+                    step(f"warning: config file {CONFIG_FILE} does not contain a JSON object")
+        except (json.JSONDecodeError, OSError) as e:
+            step(f"warning: failed to read config file {CONFIG_FILE}: {e}")
+
+    # Aliases
+    if "harness" in cfg and "tag_harness" not in cfg:
+        cfg["tag_harness"] = cfg["harness"]
+    if "model" in cfg and "tag_model" not in cfg:
+        cfg["tag_model"] = cfg["model"]
+
+    # Environment variables override config file
+    if os.environ.get("YT2MD_TAG_HARNESS"):
+        cfg["tag_harness"] = os.environ["YT2MD_TAG_HARNESS"]
+    if os.environ.get("YT2MD_TAG_MODEL"):
+        cfg["tag_model"] = os.environ["YT2MD_TAG_MODEL"]
+    if os.environ.get("YT2MD_TAGGER"):
+        cfg["tagger"] = os.environ["YT2MD_TAGGER"]
+
+    return cfg
+
+
+def save_config(updates):
+    """Save configuration key-value updates to ~/.config/yt2md/config.json.
+
+    Refuses to overwrite an existing config file that cannot be read or parsed.
+    """
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    cfg = {}
+    if CONFIG_FILE.exists():
+        try:
+            with CONFIG_FILE.open("r", encoding="utf-8") as f:
+                data = json.load(f)
+                if not isinstance(data, dict):
+                    print(f"error: config file {CONFIG_FILE} does not contain a JSON object; refusing to overwrite",
+                          file=sys.stderr)
+                    return False
+                cfg = data
+        except (json.JSONDecodeError, OSError) as e:
+            print(f"error: failed to read config file {CONFIG_FILE}: {e}; refusing to overwrite",
+                  file=sys.stderr)
+            return False
+    cfg.update(updates)
+    try:
+        with CONFIG_FILE.open("w", encoding="utf-8") as f:
+            json.dump(cfg, f, indent=2)
+            f.write("\n")
+        return True
+    except OSError as e:
+        print(f"error: failed to write config file {CONFIG_FILE}: {e}", file=sys.stderr)
+        return False
+
+
 TAG_PROMPT = """You are given a video transcript. Reply with ONE line only:
 3 to 7 topical tags, comma-separated, lowercase, kebab-case, in English.
 
@@ -76,9 +159,18 @@ Transcript:
 {body}"""
 
 
+def _build_agy(m):
+    resolved = resolve_agy_model(m)
+    return ["agy"] + (["--model", resolved] if resolved else []) + ["-p"]
+
+
 # How to invoke each CLI headlessly. 'prompt' says whether the text goes on
 # stdin or as an argument - gemini only accepts the prompt via -p.
 HARNESSES = {
+    "agy": {
+        "build": _build_agy,
+        "prompt": "argv", "model": "gemini-3.8-flash-high",
+    },
     "claude": {
         "build": lambda m: ["claude", "-p"] + (["--model", m] if m else []),
         "prompt": "stdin", "model": "haiku",
@@ -407,12 +499,13 @@ def process(url, args):
         step("  4/4 tags disabled (--no-tags)")
     else:
         t = time.perf_counter()
-        model = (args.tag_model or HARNESSES[args.tag_harness]["model"]
-                 or "CLI default model")
-        via = args.tagger or f"{args.tag_harness} ({model})"
+        raw_model = args.tag_model or HARNESSES[args.tag_harness]["model"]
+        model = resolve_agy_model(raw_model) if args.tag_harness == "agy" else raw_model
+        display_model = model or "CLI default model"
+        via = args.tagger or f"{args.tag_harness} ({display_model})"
         step(f"  4/4 generating tags via {via}...")
         tags = suggest_tags(title, channel, body,
-                            args.tag_harness, args.tag_model, args.tagger)
+                            args.tag_harness, model or raw_model, args.tagger)
         step(f"      {', '.join(tags) or '(none)'}", t)
 
     doc = build_document(title, channel, vid, lang, tags, body)
@@ -427,14 +520,29 @@ def process(url, args):
     return dest
 
 
-def main():
+def main(argv=None):
+    if argv is None:
+        argv = sys.argv[1:]
+
+    global QUIET
+    QUIET = any(arg in argv for arg in ("-q", "--quiet"))
+
+    cfg = load_config()
+    default_harness = cfg.get("tag_harness") or DEFAULT_HARNESS
+    if default_harness not in HARNESSES:
+        step(f"warning: unknown harness '{default_harness}' in config, falling back to '{DEFAULT_HARNESS}'")
+        default_harness = DEFAULT_HARNESS
+    default_model = cfg.get("tag_model")
+    default_tagger = cfg.get("tagger")
+
     ap = argparse.ArgumentParser(description="YouTube transcript -> clean Markdown")
-    ap.add_argument("urls", nargs="+")
-    ap.add_argument("-l", "--lang", default=None,
+    ap.add_argument("urls", nargs="*", help="YouTube video URL(s)")
+    ap.add_argument("-l", "--lang", default=cfg.get("lang"),
                     help="force a language (default: the video's original). "
                          "Non-original languages are translations generated on "
                          "demand and may 429")
-    ap.add_argument("-o", "--outdir", default=".", help="output directory (default: cwd)")
+    ap.add_argument("-o", "--outdir", default=cfg.get("outdir", "."),
+                    help="output directory (default: cwd)")
     ap.add_argument("--stdout", action="store_true", help="print instead of saving")
     ap.add_argument("--keep-timestamps", action="store_true", help="keep the timestamps")
     ap.add_argument("--keep-sound-tags", action="store_true",
@@ -443,21 +551,61 @@ def main():
                     help="do not print step progress")
     ap.add_argument("--no-tags", action="store_true",
                     help="skip tag generation (avoids the LLM call)")
-    ap.add_argument("--tag-harness", default="claude", choices=sorted(HARNESSES),
-                    help="CLI used to generate tags (default: claude)")
-    ap.add_argument("--tag-model", default=None, metavar="MODEL",
-                    help="model for tagging (default: haiku on claude; "
-                         "the CLI's own default elsewhere)")
-    ap.add_argument("--tagger", default=None, metavar="COMMAND",
+    ap.add_argument("--tag-harness", default=default_harness, choices=sorted(HARNESSES),
+                    help=f"CLI used to generate tags (default: {default_harness})")
+    ap.add_argument("--tag-model", default=default_model, metavar="MODEL",
+                    help="model for tagging (default: gemini-3.8-flash-high on agy; "
+                         "haiku on claude; the CLI's own default elsewhere)")
+    ap.add_argument("--tagger", default=default_tagger, metavar="COMMAND",
                     help="custom tagging command, receiving the prompt on stdin "
                          "(e.g. 'llm -m gpt-4o-mini'). Overrides "
                          "--tag-harness/--tag-model")
-    ap.add_argument("--cookies-from-browser", default=None, metavar="BROWSER",
+    ap.add_argument("--cookies-from-browser", default=cfg.get("cookies_from_browser"),
+                    metavar="BROWSER",
                     help="e.g. chrome, firefox - helps when YouTube rate-limits your IP")
-    args = ap.parse_args()
+    ap.add_argument("--show-config", action="store_true",
+                    help="show active configuration and available harnesses, then exit")
+    ap.add_argument("--set-harness", metavar="NAME", choices=sorted(HARNESSES),
+                    help="save default tag harness to ~/.config/yt2md/config.json and exit")
+    ap.add_argument("--set-model", metavar="MODEL",
+                    help="save default tag model to ~/.config/yt2md/config.json and exit")
+    args = ap.parse_args(argv)
 
-    global QUIET
     QUIET = args.quiet
+
+    if args.show_config:
+        print(f"Config file: {CONFIG_FILE} ({'found' if CONFIG_FILE.exists() else 'not created yet'})")
+        print("Effective settings:")
+        print(f"  tag_harness: {args.tag_harness}")
+        active_model = args.tag_model or HARNESSES.get(args.tag_harness, {}).get("model")
+        if args.tag_harness == "agy":
+            active_model = resolve_agy_model(active_model)
+        print(f"  tag_model:   {active_model or '(CLI default)'}")
+        print(f"  tagger:      {args.tagger or '(none)'}")
+        print(f"  outdir:      {args.outdir}")
+        print("\nAvailable harnesses:")
+        for h, d in sorted(HARNESSES.items()):
+            active = " [current default]" if h == args.tag_harness else ""
+            print(f"  {h:10} (default model: {d['model'] or 'CLI default'}){active}")
+        return 0
+
+    if args.set_harness or args.set_model:
+        updates = {}
+        if args.set_harness:
+            updates["tag_harness"] = args.set_harness
+        if args.set_model:
+            model_val = args.set_model
+            if (args.set_harness or args.tag_harness) == "agy":
+                model_val = resolve_agy_model(model_val) or model_val
+            updates["tag_model"] = model_val
+        if not save_config(updates):
+            return 1
+        for k, v in updates.items():
+            print(f"Saved {k} = {v} in {CONFIG_FILE}")
+        return 0
+
+    if not args.urls:
+        ap.error("the following arguments are required: urls")
 
     failures = 0
     for i, url in enumerate(args.urls):
