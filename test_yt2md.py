@@ -181,5 +181,268 @@ class BuildDocument(unittest.TestCase):
         self.assertIn("tags: []", yt.build_document("T", "C", "v", "en", [], "x"))
 
 
+class ResolveAgyModel(unittest.TestCase):
+    def test_default_when_empty_or_none(self):
+        self.assertEqual(yt.resolve_agy_model(None), "gemini-3.8-flash-high")
+        self.assertEqual(yt.resolve_agy_model(""), "gemini-3.8-flash-high")
+
+    def test_normalizes_gemini_flash(self):
+        self.assertEqual(yt.resolve_agy_model("gemini-3.8-flash"), "gemini-3.8-flash-high")
+        self.assertEqual(yt.resolve_agy_model("gemini 3.8 flash"), "gemini-3.8-flash-high")
+        self.assertEqual(yt.resolve_agy_model("gemini-3.7-flash"), "gemini-3.7-flash-high")
+
+    def test_normalizes_any_gemini_without_effort(self):
+        self.assertEqual(yt.resolve_agy_model("gemini-3.8-pro"), "gemini-3.8-pro-high")
+        self.assertEqual(yt.resolve_agy_model("gemini-3.9-flash"), "gemini-3.9-flash-high")
+        self.assertEqual(yt.resolve_agy_model("gemini-2.5-pro"), "gemini-2.5-pro-high")
+        self.assertEqual(yt.resolve_agy_model("gemini-pro"), "gemini-pro-high")
+
+    def test_preserves_explicit_effort(self):
+        self.assertEqual(yt.resolve_agy_model("gemini-3.8-flash-medium"), "gemini-3.8-flash-medium")
+        self.assertEqual(yt.resolve_agy_model("gemini-3.8-flash-low"), "gemini-3.8-flash-low")
+        self.assertEqual(yt.resolve_agy_model("gemini-3.8-flash-high"), "gemini-3.8-flash-high")
+        self.assertEqual(yt.resolve_agy_model("gemini-3.1-pro-medium"), "gemini-3.1-pro-medium")
+
+    def test_other_models_untouched(self):
+        self.assertEqual(yt.resolve_agy_model("claude-sonnet-4-6"), "claude-sonnet-4-6")
+        self.assertEqual(yt.resolve_agy_model("gpt-4o"), "gpt-4o")
+        self.assertEqual(yt.resolve_agy_model("llama3.2"), "llama3.2")
+
+    def test_cli_default_returns_none(self):
+        self.assertIsNone(yt.resolve_agy_model("default"))
+        self.assertIsNone(yt.resolve_agy_model("cli-default"))
+
+
+class AgyHarness(unittest.TestCase):
+    def test_registered_as_default(self):
+        self.assertEqual(yt.DEFAULT_HARNESS, "agy")
+        self.assertIn("agy", yt.HARNESSES)
+
+    def test_build_default(self):
+        build = yt.HARNESSES["agy"]["build"]
+        self.assertEqual(build("gemini-3.8-flash-high"),
+                         ["agy", "--model", "gemini-3.8-flash-high", "-p"])
+        self.assertEqual(build("gemini-3.8-flash"),
+                         ["agy", "--model", "gemini-3.8-flash-high", "-p"])
+        self.assertEqual(build("default"), ["agy", "-p"])
+
+
+class ConfigManagement(unittest.TestCase):
+    def test_load_and_save_config(self):
+        import tempfile
+        from unittest.mock import patch
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cfg_file = Path(tmpdir) / "config.json"
+            cfg_dir = Path(tmpdir)
+            with patch.object(yt, "CONFIG_FILE", cfg_file), \
+                 patch.object(yt, "CONFIG_DIR", cfg_dir), \
+                 patch.dict(yt.os.environ, {}, clear=True):
+                # Empty initially
+                self.assertEqual(yt.load_config(), {})
+
+                # Save updates
+                saved = yt.save_config({"tag_harness": "agy", "tag_model": "gemini-3.8-flash-high"})
+                self.assertTrue(saved)
+                loaded = yt.load_config()
+                self.assertEqual(loaded.get("tag_harness"), "agy")
+                self.assertEqual(loaded.get("tag_model"), "gemini-3.8-flash-high")
+
+                # Environment overrides config
+                with patch.dict(yt.os.environ, {"YT2MD_TAG_HARNESS": "claude"}):
+                    env_loaded = yt.load_config()
+                    self.assertEqual(env_loaded.get("tag_harness"), "claude")
+
+    def test_invalid_json_handling(self):
+        import io
+        import tempfile
+        from contextlib import redirect_stderr
+        from unittest.mock import patch
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cfg_file = Path(tmpdir) / "config.json"
+            cfg_file.write_text("{ broken json content", encoding="utf-8")
+            cfg_dir = Path(tmpdir)
+            with patch.object(yt, "CONFIG_FILE", cfg_file), \
+                 patch.object(yt, "CONFIG_DIR", cfg_dir), \
+                 patch.dict(yt.os.environ, {}, clear=True):
+                err_buf = io.StringIO()
+                with redirect_stderr(err_buf):
+                    # load_config gracefully returns empty dict
+                    self.assertEqual(yt.load_config(), {})
+                    # save_config refuses to overwrite damaged file
+                    saved = yt.save_config({"tag_harness": "claude"})
+                    self.assertFalse(saved)
+
+                # File content preserved
+                self.assertEqual(cfg_file.read_text(encoding="utf-8"), "{ broken json content")
+                self.assertIn("failed to read config file", err_buf.getvalue())
+                self.assertIn("refusing to overwrite", err_buf.getvalue())
+
+    def test_non_dict_json_handling(self):
+        import io
+        import tempfile
+        from contextlib import redirect_stderr
+        from unittest.mock import patch
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cfg_file = Path(tmpdir) / "config.json"
+            cfg_file.write_text('["not", "a", "dict"]\n', encoding="utf-8")
+            cfg_dir = Path(tmpdir)
+            with patch.object(yt, "CONFIG_FILE", cfg_file), \
+                 patch.object(yt, "CONFIG_DIR", cfg_dir), \
+                 patch.dict(yt.os.environ, {}, clear=True):
+                err_buf = io.StringIO()
+                with redirect_stderr(err_buf):
+                    self.assertEqual(yt.load_config(), {})
+                    saved = yt.save_config({"tag_harness": "claude"})
+                    self.assertFalse(saved)
+
+                self.assertEqual(cfg_file.read_text(encoding="utf-8"), '["not", "a", "dict"]\n')
+                self.assertIn("does not contain a JSON object", err_buf.getvalue())
+
+    def test_config_aliases(self):
+        import tempfile
+        from unittest.mock import patch
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cfg_file = Path(tmpdir) / "config.json"
+            cfg_file.write_text(json.dumps({"harness": "codex", "model": "gpt-4o"}), encoding="utf-8")
+            cfg_dir = Path(tmpdir)
+            with patch.object(yt, "CONFIG_FILE", cfg_file), \
+                 patch.object(yt, "CONFIG_DIR", cfg_dir), \
+                 patch.dict(yt.os.environ, {}, clear=True):
+                loaded = yt.load_config()
+                self.assertEqual(loaded.get("tag_harness"), "codex")
+                self.assertEqual(loaded.get("tag_model"), "gpt-4o")
+
+    def test_env_overrides_model_and_tagger(self):
+        import tempfile
+        from unittest.mock import patch
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cfg_file = Path(tmpdir) / "config.json"
+            cfg_file.write_text(json.dumps({
+                "tag_harness": "agy",
+                "tag_model": "gemini-3.8-flash-high",
+                "tagger": "default_tagger"
+            }), encoding="utf-8")
+            cfg_dir = Path(tmpdir)
+            with patch.object(yt, "CONFIG_FILE", cfg_file), \
+                 patch.object(yt, "CONFIG_DIR", cfg_dir), \
+                 patch.dict(yt.os.environ, {
+                     "YT2MD_TAG_HARNESS": "gemini",
+                     "YT2MD_TAG_MODEL": "gemini-1.5-flash",
+                     "YT2MD_TAGGER": "custom_tagger"
+                 }, clear=True):
+                loaded = yt.load_config()
+                self.assertEqual(loaded.get("tag_harness"), "gemini")
+                self.assertEqual(loaded.get("tag_model"), "gemini-1.5-flash")
+                self.assertEqual(loaded.get("tagger"), "custom_tagger")
+
+
+class CliConfigCommands(unittest.TestCase):
+    def test_show_config(self):
+        import io
+        import tempfile
+        from contextlib import redirect_stdout
+        from unittest.mock import patch
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cfg_file = Path(tmpdir) / "config.json"
+            cfg_dir = Path(tmpdir)
+            with patch.object(yt, "CONFIG_FILE", cfg_file), \
+                 patch.object(yt, "CONFIG_DIR", cfg_dir), \
+                 patch.dict(yt.os.environ, {}, clear=True):
+                buf = io.StringIO()
+                with redirect_stdout(buf):
+                    rc = yt.main(["--show-config"])
+                self.assertEqual(rc, 0)
+                out = buf.getvalue()
+                self.assertIn("Effective settings:", out)
+                self.assertIn("tag_harness: agy", out)
+                self.assertIn("tag_model:   gemini-3.8-flash-high", out)
+
+    def test_set_harness_and_model_with_normalization(self):
+        import io
+        import tempfile
+        from contextlib import redirect_stdout
+        from unittest.mock import patch
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cfg_file = Path(tmpdir) / "config.json"
+            cfg_dir = Path(tmpdir)
+            with patch.object(yt, "CONFIG_FILE", cfg_file), \
+                 patch.object(yt, "CONFIG_DIR", cfg_dir), \
+                 patch.dict(yt.os.environ, {}, clear=True):
+                buf = io.StringIO()
+                with redirect_stdout(buf):
+                    rc = yt.main(["--set-harness", "agy", "--set-model", "gemini-3.8-flash"])
+                self.assertEqual(rc, 0)
+                data = json.loads(cfg_file.read_text(encoding="utf-8"))
+                self.assertEqual(data.get("tag_harness"), "agy")
+                self.assertEqual(data.get("tag_model"), "gemini-3.8-flash-high")
+
+    def test_set_harness_refuses_corrupted_config(self):
+        import io
+        import tempfile
+        from contextlib import redirect_stderr
+        from unittest.mock import patch
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cfg_file = Path(tmpdir) / "config.json"
+            cfg_file.write_text("{ corrupt", encoding="utf-8")
+            cfg_dir = Path(tmpdir)
+            with patch.object(yt, "CONFIG_FILE", cfg_file), \
+                 patch.object(yt, "CONFIG_DIR", cfg_dir), \
+                 patch.dict(yt.os.environ, {}, clear=True):
+                err_buf = io.StringIO()
+                with redirect_stderr(err_buf):
+                    rc = yt.main(["--set-harness", "claude"])
+                self.assertEqual(rc, 1)
+                self.assertEqual(cfg_file.read_text(encoding="utf-8"), "{ corrupt")
+                self.assertIn("refusing to overwrite", err_buf.getvalue())
+
+    def test_unknown_harness_in_config_fallback(self):
+        import io
+        import tempfile
+        from contextlib import redirect_stdout, redirect_stderr
+        from unittest.mock import patch
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cfg_file = Path(tmpdir) / "config.json"
+            cfg_file.write_text(json.dumps({"tag_harness": "unknown_harness"}), encoding="utf-8")
+            cfg_dir = Path(tmpdir)
+            with patch.object(yt, "CONFIG_FILE", cfg_file), \
+                 patch.object(yt, "CONFIG_DIR", cfg_dir), \
+                 patch.dict(yt.os.environ, {}, clear=True):
+                out_buf, err_buf = io.StringIO(), io.StringIO()
+                with redirect_stdout(out_buf), redirect_stderr(err_buf):
+                    rc = yt.main(["--show-config"])
+                self.assertEqual(rc, 0)
+                self.assertIn("warning: unknown harness 'unknown_harness'", err_buf.getvalue())
+                self.assertIn("tag_harness: agy", out_buf.getvalue())
+
+    def test_quiet_suppresses_config_warning(self):
+        import io
+        import tempfile
+        from contextlib import redirect_stdout, redirect_stderr
+        from unittest.mock import patch
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cfg_file = Path(tmpdir) / "config.json"
+            cfg_file.write_text("{ corrupt json", encoding="utf-8")
+            cfg_dir = Path(tmpdir)
+            with patch.object(yt, "CONFIG_FILE", cfg_file), \
+                 patch.object(yt, "CONFIG_DIR", cfg_dir), \
+                 patch.dict(yt.os.environ, {}, clear=True):
+                out_buf, err_buf = io.StringIO(), io.StringIO()
+                with redirect_stdout(out_buf), redirect_stderr(err_buf):
+                    rc = yt.main(["-q", "--show-config"])
+                self.assertEqual(rc, 0)
+                self.assertEqual(err_buf.getvalue(), "")
+
+
 if __name__ == "__main__":
     unittest.main()
+
