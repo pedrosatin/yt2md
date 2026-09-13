@@ -181,5 +181,69 @@ class BuildDocument(unittest.TestCase):
         self.assertIn("tags: []", yt.build_document("T", "C", "v", "en", [], "x"))
 
 
+class ResolveAgyModel(unittest.TestCase):
+    def test_default_when_empty_or_none(self):
+        self.assertEqual(yt.resolve_agy_model(None), "gemini-3.8-flash-high")
+        self.assertEqual(yt.resolve_agy_model(""), "gemini-3.8-flash-high")
+
+    def test_normalizes_gemini_flash(self):
+        self.assertEqual(yt.resolve_agy_model("gemini-3.8-flash"), "gemini-3.8-flash-high")
+        self.assertEqual(yt.resolve_agy_model("gemini 3.8 flash"), "gemini-3.8-flash-high")
+        self.assertEqual(yt.resolve_agy_model("gemini-3.7-flash"), "gemini-3.7-flash-high")
+
+    def test_preserves_explicit_effort(self):
+        self.assertEqual(yt.resolve_agy_model("gemini-3.8-flash-medium"), "gemini-3.8-flash-medium")
+        self.assertEqual(yt.resolve_agy_model("gemini-3.8-flash-low"), "gemini-3.8-flash-low")
+        self.assertEqual(yt.resolve_agy_model("gemini-3.8-flash-high"), "gemini-3.8-flash-high")
+
+    def test_other_models_untouched(self):
+        self.assertEqual(yt.resolve_agy_model("claude-sonnet-4-6"), "claude-sonnet-4-6")
+
+    def test_cli_default_returns_none(self):
+        self.assertIsNone(yt.resolve_agy_model("default"))
+        self.assertIsNone(yt.resolve_agy_model("cli-default"))
+
+
+class AgyHarness(unittest.TestCase):
+    def test_registered_as_default(self):
+        self.assertEqual(yt.DEFAULT_HARNESS, "agy")
+        self.assertIn("agy", yt.HARNESSES)
+
+    def test_build_default(self):
+        build = yt.HARNESSES["agy"]["build"]
+        self.assertEqual(build("gemini-3.8-flash-high"),
+                         ["agy", "--model", "gemini-3.8-flash-high", "-p"])
+        self.assertEqual(build("gemini-3.8-flash"),
+                         ["agy", "--model", "gemini-3.8-flash-high", "-p"])
+        self.assertEqual(build("default"), ["agy", "-p"])
+
+
+class ConfigManagement(unittest.TestCase):
+    def test_load_and_save_config(self):
+        import tempfile
+        from unittest.mock import patch
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cfg_file = Path(tmpdir) / "config.json"
+            cfg_dir = Path(tmpdir)
+            with patch.object(yt, "CONFIG_FILE", cfg_file), \
+                 patch.object(yt, "CONFIG_DIR", cfg_dir), \
+                 patch.dict(yt.os.environ, {}, clear=True):
+                # Empty initially
+                self.assertEqual(yt.load_config(), {})
+
+                # Save updates
+                yt.save_config({"tag_harness": "agy", "tag_model": "gemini-3.8-flash-high"})
+                loaded = yt.load_config()
+                self.assertEqual(loaded.get("tag_harness"), "agy")
+                self.assertEqual(loaded.get("tag_model"), "gemini-3.8-flash-high")
+
+                # Environment overrides config
+                with patch.dict(yt.os.environ, {"YT2MD_TAG_HARNESS": "claude"}):
+                    env_loaded = yt.load_config()
+                    self.assertEqual(env_loaded.get("tag_harness"), "claude")
+
+
 if __name__ == "__main__":
     unittest.main()
+

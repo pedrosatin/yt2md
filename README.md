@@ -14,7 +14,7 @@ yt2md https://youtu.be/zcLPGC-tvgk -o ~/videos
       1449 cues (0.5s)
   3/4 assembling paragraphs...
       141 paragraphs, 9987 words
-  4/4 generating tags via claude (haiku)...
+  4/4 generating tags via agy (gemini-3.8-flash-high)...
       ai-agents, code-quality, software-architecture, clean-code (14.2s)
 OK LIVE Uncle Bob on Software Fundamentals in the Age of AI.md
 ```
@@ -51,7 +51,8 @@ Supported tagging CLIs, via `--tag-harness`:
 
 | Harness | Invocation used | Status |
 |---|---|---|
-| `claude` (default) | `claude -p --model haiku` | tested |
+| `agy` (default) | `agy --model gemini-3.8-flash-high -p <prompt>` | tested |
+| `claude` | `claude -p --model haiku` | tested |
 | `codex` | `codex exec --skip-git-repo-check -` | tested |
 | `opencode` | `opencode run` | tested |
 | `gemini` | `gemini --skip-trust -p <prompt>` | untested (blocked on tier eligibility) |
@@ -133,19 +134,43 @@ touching an LLM. If it prints Markdown, the setup is done.
 ### 5. Tagging (optional)
 
 `tags:` needs one of the LLM CLIs listed under [Dependencies](#dependencies) on
-your `PATH`. The default is `claude`:
+your `PATH`. The default is `agy` (with `gemini-3.8-flash-high`):
 
 ```bash
-claude --version               # already installed? nothing else to do
-yt2md <url> -o ~/videos        # tags come from claude -p --model haiku
+agy --version                  # already installed? nothing else to do
+yt2md <url> -o ~/videos        # tags come from agy -p --model gemini-3.8-flash-high
 ```
 
-If you have a different one, say so once per run:
+#### Changing the default agent
 
-```bash
-yt2md <url> --tag-harness codex
-yt2md <url> --tag-harness ollama --tag-model llama3.2
-```
+You can change the default agent in any of these ways:
+
+1. **Persistently via CLI:**
+   ```bash
+   yt2md --set-harness claude                     # switch default harness to claude
+   yt2md --set-harness agy --set-model gemini-3.8-flash
+   yt2md --show-config                            # inspect current effective defaults
+   ```
+
+2. **Via config file (`~/.config/yt2md/config.json`):**
+   ```json
+   {
+     "tag_harness": "agy",
+     "tag_model": "gemini-3.8-flash-high"
+   }
+   ```
+
+3. **Via environment variables:**
+   ```bash
+   export YT2MD_TAG_HARNESS=claude
+   export YT2MD_TAG_MODEL=haiku
+   ```
+
+4. **Per invocation:**
+   ```bash
+   yt2md <url> --tag-harness codex
+   yt2md <url> --tag-harness ollama --tag-model llama3.2
+   ```
 
 No LLM CLI at all? Use `--no-tags` and the file is written with `tags: []`.
 A tagging failure never loses the transcript - it warns and saves anyway.
@@ -162,10 +187,13 @@ yt2md <url> [<url>...] [options]
       --keep-sound-tags     keep [Laughter], [Applause], music notes
   -q, --quiet               do not print step progress
       --no-tags             skip tag generation (avoids the LLM call)
-      --tag-harness NAME    claude | codex | opencode | gemini | ollama
+      --tag-harness NAME    agy | claude | codex | gemini | ollama | opencode
       --tag-model MODEL     model for tagging
       --tagger COMMAND      custom tagging command, prompt on stdin
       --cookies-from-browser BROWSER
+      --show-config         show current defaults and available harnesses
+      --set-harness NAME    persistently save default harness to config.json
+      --set-model MODEL     persistently save default model to config.json
 ```
 
 Progress goes to stderr, so `--stdout` stays pipeable:
