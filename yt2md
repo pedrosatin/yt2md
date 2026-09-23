@@ -16,6 +16,7 @@ import os
 import random
 import re
 import shlex
+import signal
 import subprocess
 import sys
 import time
@@ -45,8 +46,35 @@ def step(msg, t0=None):
     print(f"{msg}{suffix}", file=sys.stderr, flush=True)
 
 
-def run(cmd):
-    return subprocess.run(cmd, capture_output=True, text=True, check=False)
+def run(cmd, input=None, timeout=None):
+    """Run cmd and capture its output. On timeout or Ctrl+C, kill its process group.
+
+    subprocess.run(timeout=...) kills only the direct child. If that child
+    started helpers that keep the pipes open (agy, node-based CLIs), reading the
+    output blocks until they exit. start_new_session puts the tree in its own
+    group so killpg reaches the helpers. Without input, stdin is /dev/null, so a
+    CLI that falls back to an interactive prompt gets EOF.
+    """
+    p = subprocess.Popen(cmd, stdin=subprocess.PIPE if input is not None else subprocess.DEVNULL,
+                         stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                         text=True, start_new_session=True)
+    try:
+        out, err = p.communicate(input, timeout=timeout)
+    except BaseException:  # TimeoutExpired, KeyboardInterrupt
+        try:
+            os.killpg(p.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        # A grandchild may still hold the pipes; close them instead of draining.
+        for f in (p.stdin, p.stdout, p.stderr):
+            try:
+                if f:
+                    f.close()
+            except OSError:
+                pass
+        p.wait()
+        raise
+    return subprocess.CompletedProcess(cmd, p.returncode, out, err)
 
 
 def sanitize(name):
@@ -61,6 +89,12 @@ CONFIG_DIR = Path.home() / ".config" / "yt2md"
 CONFIG_FILE = CONFIG_DIR / "config.json"
 TAG_VOCAB = CONFIG_DIR / "tags.txt"
 DEFAULT_HARNESS = "agy"
+# Seconds to wait for each tagging attempt. agy usually answers in 10-40s but
+# sometimes hangs with no output. A second call usually works.
+TAG_TIMEOUT = 60
+TAG_ATTEMPTS = 2
+# Seconds to wait for a yt-dlp metadata probe.
+PROBE_TIMEOUT = 120
 
 
 def resolve_agy_model(model):
@@ -201,7 +235,7 @@ HARNESSES = {
 ANSI = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
 
 
-def suggest_tags(title, channel, body, harness, model, custom):
+def suggest_tags(title, channel, body, harness, model, custom, timeout=TAG_TIMEOUT):
     """Ask a local LLM CLI for tags. Never brings the transcript down."""
     known = []
     if TAG_VOCAB.exists():
@@ -220,11 +254,25 @@ def suggest_tags(title, channel, body, harness, model, custom):
     if not via_stdin:
         argv = argv + [prompt]
 
+    r = None
     try:
-        r = subprocess.run(argv, input=prompt if via_stdin else None,
-                           capture_output=True, text=True, timeout=300)
-    except (OSError, subprocess.SubprocessError) as e:
+        for attempt in range(1, TAG_ATTEMPTS + 1):
+            try:
+                r = run(argv, input=prompt if via_stdin else None, timeout=timeout)
+                break
+            except subprocess.TimeoutExpired:
+                if attempt < TAG_ATTEMPTS:
+                    step(f"      {argv[0]} gave no answer in {timeout:g}s, retrying...")
+    except KeyboardInterrupt:
+        step(f"      tags skipped: interrupted, {argv[0]} killed")
+        return []
+    except (OSError, subprocess.SubprocessError, TypeError, ValueError) as e:
+        # Tagging must never cost the transcript.
         step(f"      tags skipped ({e})")
+        return []
+    if r is None:
+        step(f"      tags skipped: {argv[0]} gave no answer in {timeout:g}s "
+             f"x{TAG_ATTEMPTS} (raise it with --tag-timeout, or use --no-tags)")
         return []
     if r.returncode != 0:
         # Skip stack frames: the real cause usually comes before them.
@@ -265,7 +313,10 @@ def probe(url, cookies_from):
     cmd = ["yt-dlp", "--no-warnings", "-J", "--skip-download"]
     if cookies_from:
         cmd += ["--cookies-from-browser", cookies_from]
-    r = run(cmd + [url])
+    try:
+        r = run(cmd + [url], timeout=PROBE_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        raise RuntimeError(f"yt-dlp gave no answer in {PROBE_TIMEOUT}s") from None
     if r.returncode != 0:
         raise RuntimeError(r.stderr.strip().splitlines()[-1] if r.stderr else "yt-dlp failed")
     return json.loads(r.stdout)
@@ -505,7 +556,8 @@ def process(url, args):
         via = args.tagger or f"{args.tag_harness} ({display_model})"
         step(f"  4/4 generating tags via {via}...")
         tags = suggest_tags(title, channel, body,
-                            args.tag_harness, model or raw_model, args.tagger)
+                            args.tag_harness, model or raw_model, args.tagger,
+                            args.tag_timeout)
         step(f"      {', '.join(tags) or '(none)'}", t)
 
     doc = build_document(title, channel, vid, lang, tags, body)
@@ -560,6 +612,10 @@ def main(argv=None):
                     help="custom tagging command, receiving the prompt on stdin "
                          "(e.g. 'llm -m gpt-4o-mini'). Overrides "
                          "--tag-harness/--tag-model")
+    ap.add_argument("--tag-timeout", type=float, default=cfg.get("tag_timeout", TAG_TIMEOUT),
+                    metavar="SECONDS",
+                    help=f"seconds to wait for each of the {TAG_ATTEMPTS} tagging attempts "
+                         f"(default: {TAG_TIMEOUT}). The transcript is saved either way")
     ap.add_argument("--cookies-from-browser", default=cfg.get("cookies_from_browser"),
                     metavar="BROWSER",
                     help="e.g. chrome, firefox - helps when YouTube rate-limits your IP")
@@ -570,6 +626,10 @@ def main(argv=None):
     ap.add_argument("--set-model", metavar="MODEL",
                     help="save default tag model to ~/.config/yt2md/config.json and exit")
     args = ap.parse_args(argv)
+    t = args.tag_timeout
+    if isinstance(t, bool) or not isinstance(t, (int, float)) or not t > 0:
+        ap.error("--tag-timeout (or tag_timeout in config.json) must be a positive "
+                 "number of seconds")
 
     QUIET = args.quiet
 
