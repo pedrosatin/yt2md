@@ -157,7 +157,8 @@ You can change the default agent in any of these ways:
    ```json
    {
      "tag_harness": "agy",
-     "tag_model": "gemini-3.8-flash-high"
+     "tag_model": "gemini-3.8-flash-high",
+     "tag_timeout": 60
    }
    ```
 
@@ -175,6 +176,9 @@ You can change the default agent in any of these ways:
 
 No LLM CLI at all? Use `--no-tags` and the file is written with `tags: []`.
 A tagging failure never loses the transcript - it warns and saves anyway.
+A tagger that hangs is killed after `--tag-timeout` seconds (60 by default) and
+retried once. Ctrl+C during tagging skips the tags for that video and still
+saves the file.
 
 ## Usage
 
@@ -191,6 +195,7 @@ yt2md <url> [<url>...] [options]
       --tag-harness NAME    agy | claude | codex | gemini | ollama | opencode
       --tag-model MODEL     model for tagging
       --tagger COMMAND      custom tagging command, prompt on stdin
+      --tag-timeout SECONDS seconds per tagging attempt (default: 60, 2 attempts)
       --cookies-from-browser BROWSER
       --show-config         show current defaults and available harnesses
       --set-harness NAME    persistently save default harness to config.json

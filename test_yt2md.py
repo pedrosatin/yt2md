@@ -5,6 +5,7 @@ Run with:  python3 -m unittest -v test_yt2md
 """
 
 import json
+import shlex
 import unittest
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
@@ -441,6 +442,64 @@ class CliConfigCommands(unittest.TestCase):
                     rc = yt.main(["-q", "--show-config"])
                 self.assertEqual(rc, 0)
                 self.assertEqual(err_buf.getvalue(), "")
+
+
+class Run(unittest.TestCase):
+    def test_timeout_kills_grandchildren_holding_the_pipes(self):
+        import time
+        t = time.perf_counter()
+        with self.assertRaises(yt.subprocess.TimeoutExpired):
+            yt.run(["sh", "-c", "sleep 30 & sleep 30"], timeout=0.3)
+        self.assertLess(time.perf_counter() - t, 5)
+
+    def test_stdin_is_closed_without_input(self):
+        r = yt.run(["cat"], timeout=5)
+        self.assertEqual(r.stdout, "")
+
+
+class SuggestTagsTimeout(unittest.TestCase):
+    def setUp(self):
+        import tempfile
+        from unittest.mock import patch
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.tmp = Path(tmp.name)
+        for p in (patch.object(yt, "QUIET", True),
+                  patch.object(yt, "TAG_VOCAB", self.tmp / "tags.txt")):
+            p.start()
+            self.addCleanup(p.stop)
+
+    def test_hanging_tagger_is_skipped_after_retries(self):
+        tags = yt.suggest_tags("t", "c", "b", "agy", None, "sleep 30", timeout=0.2)
+        self.assertEqual(tags, [])
+
+    def test_retry_succeeds_on_second_attempt(self):
+        # Hangs on the first call only: the marker file exists on the second.
+        mark = self.tmp / "ran"
+        script = f"cat >/dev/null; [ -e {mark} ] || {{ touch {mark}; sleep 30; }}; echo ai-tools"
+        tags = yt.suggest_tags("t", "c", "b", "agy", None,
+                               f"sh -c {shlex.quote(script)}", timeout=0.5)
+        self.assertEqual(tags, ["ai-tools"])
+
+    def test_ctrl_c_skips_tags(self):
+        from unittest.mock import patch
+        with patch.object(yt, "run", side_effect=KeyboardInterrupt):
+            self.assertEqual(yt.suggest_tags("t", "c", "b", "agy", None, "cat"), [])
+
+
+class TagTimeoutValidation(unittest.TestCase):
+    def test_invalid_config_values_are_rejected(self):
+        from unittest.mock import patch
+        for bad in (None, True, [1], 0, -5):
+            with self.subTest(bad=bad), \
+                 patch.object(yt, "load_config", return_value={"tag_timeout": bad}), \
+                 patch("sys.stderr"), self.assertRaises(SystemExit):
+                yt.main(["--no-tags", "https://youtu.be/x"])
+
+    def test_invalid_flag_is_rejected(self):
+        from unittest.mock import patch
+        with patch("sys.stderr"), self.assertRaises(SystemExit):
+            yt.main(["--tag-timeout", "0", "https://youtu.be/x"])
 
 
 if __name__ == "__main__":
