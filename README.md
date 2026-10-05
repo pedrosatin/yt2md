@@ -2,6 +2,8 @@
 
 Turn a YouTube video into a clean Markdown transcript, ready for a knowledge base.
 
+Criado por [@pedrosatin](https://github.com/pedrosatin)
+
 ```bash
 yt2md https://youtu.be/zcLPGC-tvgk -o ~/videos
 ```
@@ -269,6 +271,12 @@ python3 -m unittest -v test_yt2md
 ```
 
 27 offline tests, no network and no LLM.
+
+## Contributing
+
+Contributions and bug reports are welcome. Open an issue at
+[https://github.com/pedrosatin/yt2md/issues](https://github.com/pedrosatin/yt2md/issues)
+to propose a change or report a problem.
 
 ## License
 
