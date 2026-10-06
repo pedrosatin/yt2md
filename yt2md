@@ -238,29 +238,51 @@ HARNESSES = {
 # comes out as '\x1b[0mtag'.
 ANSI = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
 
+# Only these harnesses run tagging. Each entry lists the provider variables the
+# CLI needs on top of TAG_BASE_ENV; every other variable is dropped, so tokens
+# for unrelated services never reach the process that reads the transcript.
 TAG_AUTH_ENV = {
-    "claude": {"ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_BASE_URL"},
+    "claude": {"ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN",
+               "ANTHROPIC_BASE_URL", "CLAUDE_CONFIG_DIR",
+               # Bedrock and Vertex backends.
+               "CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX", "AWS_REGION", "AWS_PROFILE",
+               "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN",
+               "ANTHROPIC_VERTEX_PROJECT_ID", "CLOUD_ML_REGION", "GOOGLE_APPLICATION_CREDENTIALS"},
     "ollama": {"OLLAMA_HOST", "OLLAMA_API_KEY"},
+}
+
+# Process basics plus proxy and CA settings. Claude runs on Node, which reads
+# corporate CAs from NODE_EXTRA_CA_CERTS rather than SSL_CERT_FILE.
+TAG_BASE_ENV = {
+    "PATH", "HOME", "USER", "LANG", "LC_ALL", "TMPDIR",
+    "SSL_CERT_FILE", "SSL_CERT_DIR", "NODE_EXTRA_CA_CERTS",
+    "HTTPS_PROXY", "HTTP_PROXY", "NO_PROXY", "https_proxy", "http_proxy", "no_proxy",
 }
 
 
 def tagging_environment(harness):
-    allowed = {"PATH", "HOME", "USER", "LANG", "LC_ALL", "TMPDIR", "SSL_CERT_FILE", "SSL_CERT_DIR"}
-    allowed.update(TAG_AUTH_ENV.get(harness, set()))
+    allowed = TAG_BASE_ENV | TAG_AUTH_ENV.get(harness, set())
     return {key: value for key, value in os.environ.items() if key in allowed}
 
 
-def secure_tagging_command(argv, harness, directory):
-    if harness not in TAG_AUTH_ENV:
-        raise ValueError(f"{harness} has no verified tool-free tagging mode; choose --tag-harness claude or ollama, or --no-tags")
-    return argv
+def tag_skip_reason(harness, custom):
+    """Why tagging will not run for this harness, or None when it will."""
+    if custom or harness not in TAG_AUTH_ENV:
+        return (f"{'custom tagger' if custom else harness} has no verified tool-free mode; "
+                "choose --tag-harness claude or ollama, or --no-tags")
+    return None
+
+
+def warn(msg):
+    """Print to stderr even under --quiet, for events that change the output."""
+    print(msg, file=sys.stderr, flush=True)
 
 
 def suggest_tags(title, channel, body, harness, model, custom, timeout=TAG_TIMEOUT):
     """Ask a local LLM CLI for tags. Never brings the transcript down."""
-    if custom or harness not in TAG_AUTH_ENV:
-        step(f"      tags skipped: {'custom tagger' if custom else harness} has no verified tool-free mode; "
-             "choose --tag-harness claude or ollama, or --no-tags")
+    reason = tag_skip_reason(harness, custom)
+    if reason:
+        warn(f"      tags skipped: {reason}")
         return []
     known = []
     if TAG_VOCAB.exists():
@@ -278,8 +300,7 @@ def suggest_tags(title, channel, body, harness, model, custom, timeout=TAG_TIMEO
 
     r = None
     try:
-        with tempfile.TemporaryDirectory(prefix='yt2md-tags-') as directory:
-            argv = secure_tagging_command(argv, harness, directory)
+        with tempfile.TemporaryDirectory(prefix="yt2md-tags-") as directory:
             for attempt in range(1, TAG_ATTEMPTS + 1):
                 try:
                     r = run(argv, input=prompt if via_stdin else None, timeout=timeout,
@@ -578,12 +599,15 @@ def process(url, args):
         raw_model = args.tag_model or HARNESSES[args.tag_harness]["model"]
         model = resolve_agy_model(raw_model) if args.tag_harness == "agy" else raw_model
         display_model = model or "CLI default model"
-        via = args.tagger or f"{args.tag_harness} ({display_model})"
-        step(f"  4/4 generating tags via {via}...")
-        tags = suggest_tags(title, channel, body,
-                            args.tag_harness, model or raw_model, args.tagger,
-                            args.tag_timeout)
-        step(f"      {', '.join(tags) or '(none)'}", t)
+        reason = tag_skip_reason(args.tag_harness, args.tagger)
+        if reason:
+            warn(f"  4/4 tags skipped: {reason}")
+        else:
+            step(f"  4/4 generating tags via {args.tag_harness} ({display_model})...")
+            tags = suggest_tags(title, channel, body,
+                                args.tag_harness, model or raw_model, None,
+                                args.tag_timeout)
+            step(f"      {', '.join(tags) or '(none)'}", t)
 
     doc = build_document(title, channel, vid, lang, tags, body)
 
@@ -634,9 +658,8 @@ def main(argv=None):
                     help="model for tagging (default: gemini-3.8-flash-high on agy; "
                          "haiku on claude; the CLI's own default elsewhere)")
     ap.add_argument("--tagger", default=default_tagger, metavar="COMMAND",
-                    help="custom tagging command, receiving the prompt on stdin "
-                         "(e.g. 'llm -m gpt-4o-mini'). Overrides "
-                         "--tag-harness/--tag-model")
+                    help="custom tagging command. Tagging is skipped when it is set, "
+                         "because a custom command has no verified tool-free mode")
     ap.add_argument("--tag-timeout", type=float, default=cfg.get("tag_timeout", TAG_TIMEOUT),
                     metavar="SECONDS",
                     help=f"seconds to wait for each of the {TAG_ATTEMPTS} tagging attempts "
