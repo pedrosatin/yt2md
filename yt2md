@@ -2,7 +2,7 @@
 """yt2md - download a YouTube transcript and save it as '<title>.md'.
 
 Usage:
-    yt2md <url> [<url>...] [-l LANG] [-o DIR] [--stdout] [--keep-timestamps]
+    yt2md <url> [<url>...] [-l LANG] [-o DIR] [--stdout] [--overwrite] [--keep-timestamps]
 
 Defaults to the video's original language. Asking for a different one makes
 YouTube generate a translation on demand, which is slow and frequently 429s.
@@ -11,16 +11,21 @@ Requires: yt-dlp on PATH.
 """
 
 import argparse
+import ipaddress
 import json
+import math
 import os
 import random
 import re
 import signal
+import socket
+import stat
 import subprocess
 import sys
 import tempfile
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
@@ -28,6 +33,16 @@ from pathlib import Path
 UA = ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/128.0 Safari/537.36")
 MAX_RETRIES = 5
+# Upper bounds for what a subtitle server can make us read or wait for.
+MAX_SUBTITLE_BYTES = 32 * 1024 * 1024
+MAX_RETRY_AFTER = 60.0
+# Tries for '<title>-2.md', '<title>-3.md'... before giving up.
+MAX_NAME_ATTEMPTS = 1000
+# File name limit in UTF-8 bytes before '-<n>' and '.md'. Most file systems
+# allow 255 bytes per name, and CJK or emoji titles use 3 to 4 bytes a character.
+MAX_STEM_BYTES = 200
+# How much of an existing file is read to find its 'video_id'.
+FRONTMATTER_READ_BYTES = 64 * 1024
 
 # Silence (in seconds) between cues that triggers a paragraph break.
 PARAGRAPH_GAP = 2.5
@@ -77,11 +92,176 @@ def run(cmd, input=None, timeout=None, cwd=None, env=None):
     return subprocess.CompletedProcess(cmd, p.returncode, out, err)
 
 
+# Terminal escape sequences (CSI, OSC, other ESC-prefixed codes), C0/C1 control
+# characters and Unicode direction overrides. Video metadata comes from third
+# parties and reaches the terminal, file names and Markdown.
+TERMINAL_ESCAPE = re.compile(
+    r"\x1b\[[0-?]*[ -/]*[@-~]"            # CSI
+    r"|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)?"  # OSC, terminated by BEL or ST
+    r"|\x1b[@-Z\\-_]"                     # other two-character escapes
+)
+CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f-\x9f\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]")
+
+
+def clean_meta(value):
+    """Drop escape sequences and control characters from untrusted metadata.
+
+    Line breaks and tabs become spaces, so the result is always one line.
+    """
+    text = TERMINAL_ESCAPE.sub("", str(value))
+    text = re.sub(r"[\t\n\r\v\f\x85\u2028\u2029]", " ", text)
+    return CONTROL_CHARS.sub("", text)
+
+
+def cut_utf8(text, limit):
+    """Cut text to at most limit bytes of UTF-8 without splitting a character."""
+    return text.encode("utf-8")[:limit].decode("utf-8", "ignore")
+
+
 def sanitize(name):
-    """Turn a video title into a safe filename."""
-    name = re.sub(r'[/\\:*?"<>|\n\r\t]', " ", name)
-    name = re.sub(r"\s+", " ", name).strip().strip(".")
-    return name[:180] or "video"
+    """Turn a video title into a safe filename of at most MAX_STEM_BYTES bytes."""
+    name = clean_meta(name)
+    name = re.sub(r'[/\\:*?"<>|]', " ", name)
+    name = re.sub(r"\s+", " ", name).strip(" .")
+    return cut_utf8(name, MAX_STEM_BYTES).strip(" .") or "video"
+
+
+# File names that tools read as instructions or project metadata. A video title
+# never gets one of these as-is (compared case-insensitively, before any '.').
+# Windows device names are here because they cannot be created on Windows.
+RESERVED_STEMS = {
+    "agents", "agent", "claude", "gemini", "copilot-instructions", "skill",
+    "conventions", "crush", "qwen", "warp",
+    "readme", "contributing", "security", "changelog", "license", "code_of_conduct",
+    "con", "prn", "aux", "nul", "conin$", "conout$",
+    *(f"com{i}" for i in range(10)), *(f"lpt{i}" for i in range(10)),
+}
+
+
+def output_stem(title, vid):
+    """File name (without .md) for a video, never a reserved name.
+
+    sanitize() already strips leading dots, so the name is never hidden.
+    """
+    stem = sanitize(title)
+    if stem.split(".")[0].strip().casefold() in RESERVED_STEMS:
+        suffix = re.sub(r"[^A-Za-z0-9_-]", "", str(vid or ""))[:64] or "video"
+        base = cut_utf8(stem, MAX_STEM_BYTES - len(suffix) - 1).strip(" .") or "video"
+        stem = f"{base}-{suffix}"
+    return stem
+
+
+def existing_video_id(path):
+    """The 'video_id' in the frontmatter of a regular file at path, or None.
+
+    Symlinks, FIFOs and other non-regular files return None without blocking.
+    Both the quoted form and the bare form of older files are read.
+    """
+    flags = (os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+             | getattr(os, "O_CLOEXEC", 0))
+    try:
+        fd = os.open(path, flags)
+    except OSError:
+        return None
+    with os.fdopen(fd, "rb") as f:
+        if not stat.S_ISREG(os.fstat(f.fileno()).st_mode):
+            return None
+        head = f.read(FRONTMATTER_READ_BYTES).decode("utf-8", "replace")
+    lines = head.splitlines()
+    if not lines or lines[0].strip() != "---":
+        return None
+    for line in lines[1:]:
+        if line.strip() == "---":
+            break
+        key, sep, value = line.partition(":")
+        if sep and key.strip() == "video_id":
+            value = value.strip()
+            if value.startswith('"'):
+                try:
+                    value = json.loads(value)
+                except ValueError:
+                    return None
+            else:
+                value = value.strip("'")
+            return value if isinstance(value, str) and value else None
+    return None
+
+
+def replace_atomically(dest, data):
+    """Replace dest with data through a temporary file and os.replace.
+
+    The temporary file is created with O_EXCL in the same directory.
+    os.replace swaps the directory entry, so a symlink planted at dest after
+    the check is replaced, not followed. A symlink, FIFO or other non-regular
+    file already at dest is refused.
+    """
+    try:
+        st = os.lstat(dest)
+    except FileNotFoundError:
+        st = None
+    if st is not None and not stat.S_ISREG(st.st_mode):
+        kind = "symlink" if stat.S_ISLNK(st.st_mode) else "non-regular file"
+        raise RuntimeError(f"refusing to replace {kind} {dest}")
+    flags = (os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+             | getattr(os, "O_CLOEXEC", 0))
+    for _ in range(100):
+        tmp = dest.parent / f".{dest.name}.{os.urandom(6).hex()}.tmp"
+        try:
+            fd = os.open(tmp, flags, 0o666)
+            break
+        except FileExistsError:
+            continue
+    else:
+        raise RuntimeError(f"could not create a temporary file in {dest.parent}")
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+        os.replace(tmp, dest)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+    return dest
+
+
+def write_output(outdir, stem, doc, overwrite=False, video_id=None):
+    """Write doc to '<outdir>/<stem>.md' and return the absolute path.
+
+    The first free name among '<stem>.md', '<stem>-2.md', '<stem>-3.md'... is
+    used, created with O_EXCL so a file or symlink that appears in the meantime
+    is not followed or replaced. A regular file whose frontmatter has the same
+    video_id is the same video saved earlier: it is replaced atomically instead
+    of getting a new name. With overwrite, '<stem>.md' is always replaced
+    atomically, but a symlink, FIFO or other non-regular file there is refused.
+    """
+    base = Path(outdir).expanduser().resolve()
+    base.mkdir(parents=True, exist_ok=True)
+    data = doc.encode("utf-8")
+    create = (os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+              | getattr(os, "O_CLOEXEC", 0))
+    attempts = 1 if overwrite else MAX_NAME_ATTEMPTS
+    for n in range(1, attempts + 1):
+        name = f"{stem}.md" if n == 1 else f"{stem}-{n}.md"
+        dest = base / name
+        # Defense for direct callers: output_stem never produces these.
+        if (name.startswith(".") or os.path.basename(name) != name
+                or dest.parent != base):
+            raise RuntimeError(f"unsafe output file name: {name!r}")
+        if overwrite:
+            return replace_atomically(dest, data)
+        try:
+            fd = os.open(dest, create, 0o666)
+        except FileExistsError:
+            if video_id and existing_video_id(dest) == video_id:
+                return replace_atomically(dest, data)
+            continue
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+        return dest
+    raise RuntimeError(f"no free file name for '{stem}.md' in {base} "
+                       f"after {MAX_NAME_ATTEMPTS} tries")
 
 
 # Configuration and accumulated tag vocabulary.
@@ -349,22 +529,73 @@ def suggest_tags(title, channel, body, harness, model, custom, timeout=TAG_TIMEO
     return tags
 
 
+# Characters JSON leaves raw but YAML treats as line breaks or forbids.
+YAML_UNSAFE = re.compile(r"[\x7f-\x9f\u2028\u2029\ufeff\ud800-\udfff]")
+
+
 def yaml_str(value):
-    """Escape a value so it fits inside a double-quoted YAML scalar."""
-    return str(value).replace("\\", "\\\\").replace('"', '\\"')
+    """Escape a value so it fits inside a double-quoted YAML scalar.
+
+    JSON string escaping is valid YAML double-quoted escaping; it covers
+    quotes, backslashes, line breaks and other control characters.
+    """
+    text = json.dumps(str(value), ensure_ascii=False)[1:-1]
+    return YAML_UNSAFE.sub(lambda m: f"\\u{ord(m.group()):04x}", text)
 
 
-def probe(url, cookies_from):
-    """Return yt-dlp's metadata dict (a single network call)."""
+def yaml_quote(value):
+    return f'"{yaml_str(value)}"'
+
+
+YAML_PLAIN_TAG = re.compile(r"[a-z][a-z0-9-]*")
+YAML_KEYWORDS = {"true", "false", "null", "yes", "no", "on", "off", "y", "n"}
+
+
+def yaml_tag(tag):
+    """A tag as a flow-sequence item: bare when unambiguous, quoted otherwise."""
+    tag = str(tag)
+    if YAML_PLAIN_TAG.fullmatch(tag) and tag not in YAML_KEYWORDS:
+        return tag
+    return yaml_quote(tag)
+
+
+# A YouTube video ID: 11 characters, which may start with '-'.
+VIDEO_ID = re.compile(r"[A-Za-z0-9_-]{11}")
+
+
+def ytdlp_command(url, cookies_from):
+    """yt-dlp argv for a metadata probe.
+
+    '--' keeps the URL from being read as an option. Arguments starting with
+    '-' are refused unless they are a video ID. Config files are handled by
+    running yt-dlp in an empty directory (see probe).
+    """
+    if not isinstance(url, str) or not url.strip():
+        raise RuntimeError("empty URL")
+    if url.lstrip().startswith("-") and not VIDEO_ID.fullmatch(url):
+        raise RuntimeError(f"not a URL or video ID: {clean_meta(url)!r}")
     cmd = ["yt-dlp", "--no-warnings", "-J", "--skip-download"]
     if cookies_from:
         cmd += ["--cookies-from-browser", cookies_from]
+    return cmd + ["--", url]
+
+
+def probe(url, cookies_from):
+    """Return yt-dlp's metadata dict (a single network call).
+
+    yt-dlp runs in an empty temporary directory, so a 'yt-dlp.conf' or plugin
+    in the user's current directory is never read. The user's own yt-dlp
+    config (~/.config/yt-dlp/config and the system one) still applies.
+    """
+    cmd = ytdlp_command(url, cookies_from)
     try:
-        r = run(cmd + [url], timeout=PROBE_TIMEOUT)
+        with tempfile.TemporaryDirectory(prefix="yt2md-probe-") as directory:
+            r = run(cmd, timeout=PROBE_TIMEOUT, cwd=directory)
     except subprocess.TimeoutExpired:
         raise RuntimeError(f"yt-dlp gave no answer in {PROBE_TIMEOUT}s") from None
     if r.returncode != 0:
-        raise RuntimeError(r.stderr.strip().splitlines()[-1] if r.stderr else "yt-dlp failed")
+        raise RuntimeError(clean_meta(r.stderr.strip().splitlines()[-1])
+                           if r.stderr.strip() else "yt-dlp failed")
     return json.loads(r.stdout)
 
 
@@ -444,25 +675,107 @@ def pick_track(info, override):
         f"{len(auto)} automatic)")
 
 
+# Hosts made only of digits, dots and hex digits with '0x'. The C resolver
+# reads forms such as '2130706433', '0x7f000001', '127.1' and '0177.0.0.1' as
+# IPv4 addresses, which ipaddress does not.
+NUMERIC_HOST = re.compile(r"(?:0x[0-9a-f]*|[0-9]+)(?:\.(?:0x[0-9a-f]*|[0-9]+))*")
+# NAT64 well-known prefix: the last 32 bits are an IPv4 address.
+NAT64 = ipaddress.ip_network("64:ff9b::/96")
+
+
+def check_subtitle_url(url):
+    """Accept only https:// URLs that do not point at this machine or a private network.
+
+    The subtitle URL comes from the extractor's metadata, so a hostile page
+    could otherwise make yt2md read file:// paths or call internal services.
+    Only the URL itself is checked: 'localhost', IP literals (including
+    numeric IPv4 forms and NAT64 addresses) outside public ranges are refused.
+    Host names are not resolved, so a name pointing at an internal address
+    passes this check.
+    """
+    try:
+        parts = urllib.parse.urlsplit(url)
+        host = parts.hostname
+    except (ValueError, TypeError):
+        host, parts = None, None
+    if parts is None or parts.scheme.lower() != "https" or not host:
+        scheme = parts.scheme if parts is not None else "?"
+        raise RuntimeError(f"refusing subtitle URL with scheme '{clean_meta(scheme) or 'none'}' "
+                           "(only https:// is fetched)")
+    host = host.rstrip(".").lower()
+    if host == "localhost" or host.endswith(".localhost"):
+        raise RuntimeError(f"refusing subtitle URL on local host '{host}'")
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        if not NUMERIC_HOST.fullmatch(host):
+            return url
+        try:
+            ip = ipaddress.IPv4Address(socket.inet_aton(host))
+        except (OSError, ValueError):
+            raise RuntimeError(f"refusing subtitle URL on numeric host '{clean_meta(host)}'") from None
+    if ip.version == 6:
+        if ip.ipv4_mapped:
+            ip = ip.ipv4_mapped
+        elif ip in NAT64:
+            ip = ipaddress.IPv4Address(int(ip) & 0xFFFFFFFF)
+    if not ip.is_global:
+        raise RuntimeError(f"refusing subtitle URL on non-public address '{clean_meta(host)}'")
+    return url
+
+
+class _CheckedRedirect(urllib.request.HTTPRedirectHandler):
+    """Apply check_subtitle_url to every redirect target."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        check_subtitle_url(newurl)
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+def retry_after(headers, fallback):
+    """Seconds to wait from a Retry-After header, capped at MAX_RETRY_AFTER."""
+    raw = (headers.get("Retry-After") if headers else None) or ""
+    try:
+        wait = float(str(raw)[:32])
+    except ValueError:  # an HTTP date or garbage
+        return fallback
+    if not math.isfinite(wait) or wait <= 0:
+        return fallback
+    return min(wait, MAX_RETRY_AFTER)
+
+
+def read_limited(resp, limit=MAX_SUBTITLE_BYTES):
+    """Read at most limit bytes; a longer body is an error, not a truncation."""
+    length = resp.headers.get("Content-Length") if resp.headers else None
+    if length and length.strip().isdigit() and int(length) > limit:
+        raise RuntimeError(f"subtitle response too large ({int(length)} bytes)")
+    data = resp.read(limit + 1)
+    if len(data) > limit:
+        raise RuntimeError(f"subtitle response larger than {limit} bytes")
+    return data
+
+
 def fetch(url):
     """Download the subtitle track with exponential backoff - YouTube 429s easily."""
+    check_subtitle_url(url)
+    opener = urllib.request.build_opener(_CheckedRedirect)
     delay = 2.0
     for attempt in range(MAX_RETRIES):
         try:
             req = urllib.request.Request(url, headers={"User-Agent": UA})
-            with urllib.request.urlopen(req, timeout=30) as resp:
-                return resp.read().decode("utf-8", "replace")
+            with opener.open(req, timeout=30) as resp:
+                return read_limited(resp).decode("utf-8", "replace")
         except urllib.error.HTTPError as e:
             if e.code not in (429, 500, 503) or attempt == MAX_RETRIES - 1:
                 raise RuntimeError(f"HTTP {e.code} while downloading subtitles") from e
-            wait = float(e.headers.get("Retry-After") or 0) or delay
+            wait = retry_after(e.headers, delay)
             step(f"      HTTP {e.code}, retrying in {wait:.0f}s "
                  f"({attempt + 1}/{MAX_RETRIES})")
             time.sleep(wait + random.uniform(0, 1))
             delay *= 2
         except urllib.error.URLError as e:
             if attempt == MAX_RETRIES - 1:
-                raise RuntimeError(f"network error: {e.reason}") from e
+                raise RuntimeError(f"network error: {clean_meta(e.reason)}") from e
             time.sleep(delay)
             delay *= 2
     raise RuntimeError("failed to download subtitles")
@@ -553,33 +866,37 @@ def build_document(title, channel, vid, lang, tags, body):
     hashes only the body below the '---', so editing these fields later (tags,
     reviewed flags) does not trigger a paid re-extraction.
     """
+    heading = re.sub(r"\s+", " ", clean_meta(title)).strip() or "video"
     return (
         "---\n"
-        f'source_url: "{yaml_str(f"https://www.youtube.com/watch?v={vid}")}"\n'
+        f"source_url: {yaml_quote(f'https://www.youtube.com/watch?v={vid}')}\n"
         "type: video\n"
-        f'title: "{yaml_str(title)}"\n'
-        f'author: "{yaml_str(channel)}"\n'
+        f"title: {yaml_quote(title)}\n"
+        f"author: {yaml_quote(channel)}\n"
         f"captured_at: {datetime.now(timezone.utc).isoformat(timespec='seconds')}\n"
-        f"video_id: {vid}\n"
-        f"subtitle_lang: {lang}\n"
-        f"tags: [{', '.join(tags)}]\n"
+        f"video_id: {yaml_quote(vid)}\n"
+        f"subtitle_lang: {yaml_quote(lang)}\n"
+        f"tags: [{', '.join(yaml_tag(t) for t in tags)}]\n"
         "---\n\n"
-        f"# {title}\n\n{body}\n"
+        f"# {heading}\n\n{body}\n"
     )
 
 
 def process(url, args):
-    step(f"-> {url}")
+    step(f"-> {clean_meta(url)}")
 
     t = time.perf_counter()
     step("  1/4 fetching metadata...")
     info = probe(url, args.cookies_from_browser)
-    title = info.get("title", "video")
-    channel = info.get("uploader", "")
-    vid = info.get("id", "")
+    # Metadata comes from the video's uploader: strip escapes and line breaks
+    # before it reaches the terminal, the file name or the Markdown.
+    title = re.sub(r"\s+", " ", clean_meta(info.get("title") or "video")).strip() or "video"
+    channel = re.sub(r"\s+", " ", clean_meta(info.get("uploader") or "")).strip()
+    vid = clean_meta(info.get("id") or "")
     step(f"      {title} - {channel}", t)
 
     lang, sub_url = pick_track(info, args.lang)
+    lang = clean_meta(lang)
     t = time.perf_counter()
     step(f"  2/4 downloading '{lang}' subtitles...")
     cues = parse_json3(fetch(sub_url), args.keep_sound_tags)
@@ -615,10 +932,8 @@ def process(url, args):
         sys.stdout.write(doc)
         return None
 
-    dest = Path(args.outdir).expanduser() / f"{sanitize(title)}.md"
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    dest.write_text(doc, encoding="utf-8")
-    return dest
+    return write_output(args.outdir, output_stem(title, vid), doc,
+                        overwrite=getattr(args, "overwrite", False), video_id=vid)
 
 
 def main(argv=None):
@@ -645,6 +960,10 @@ def main(argv=None):
     ap.add_argument("-o", "--outdir", default=cfg.get("outdir", "."),
                     help="output directory (default: cwd)")
     ap.add_argument("--stdout", action="store_true", help="print instead of saving")
+    ap.add_argument("--overwrite", action="store_true",
+                    help="always replace '<title>.md' instead of saving as "
+                         "'<title>-2.md', '<title>-3.md'... when it holds another "
+                         "video (the same video is always updated)")
     ap.add_argument("--keep-timestamps", action="store_true", help="keep the timestamps")
     ap.add_argument("--keep-sound-tags", action="store_true",
                     help="keep annotations such as [Laughter], [Applause], music notes")
@@ -725,7 +1044,7 @@ def main(argv=None):
                 print(f"OK {dest}")
         except Exception as e:  # noqa: BLE001
             failures += 1
-            print(f"FAIL {url}: {e}", file=sys.stderr)
+            print(f"FAIL {clean_meta(url)}: {clean_meta(e)}", file=sys.stderr)
     return 1 if failures else 0
 
 
