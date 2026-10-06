@@ -240,8 +240,6 @@ ANSI = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
 
 TAG_AUTH_ENV = {
     "claude": {"ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_BASE_URL"},
-    "gemini": {"GEMINI_API_KEY", "GOOGLE_API_KEY", "GOOGLE_APPLICATION_CREDENTIALS",
-               "GOOGLE_CLOUD_PROJECT", "GOOGLE_CLOUD_LOCATION"},
     "ollama": {"OLLAMA_HOST", "OLLAMA_API_KEY"},
 }
 
@@ -255,15 +253,6 @@ def tagging_environment(harness):
 def secure_tagging_command(argv, harness, directory):
     if harness not in TAG_AUTH_ENV:
         raise ValueError(f"{harness} has no verified tool-free tagging mode; choose --tag-harness claude or ollama, or --no-tags")
-    if harness == "gemini":
-        central = [Path('/etc/gemini-cli/policies'), Path('/Library/Application Support/GeminiCli/policies')]
-        if os.environ.get('PROGRAMDATA'):
-            central.append(Path(os.environ['PROGRAMDATA']) / 'gemini-cli' / 'policies')
-        if any(path.exists() and any(path.glob('*.toml')) for path in central):
-            raise ValueError("Gemini central policies override the no-tools flag; use Claude/Ollama or --no-tags")
-        policy = Path(directory) / 'deny-tools.toml'
-        policy.write_text('[[rule]]\ntoolName = "*"\ndecision = "deny"\npriority = 999\n', encoding='utf-8')
-        argv = [argv[0], '--admin-policy', str(policy)] + argv[1:]
     return argv
 
 

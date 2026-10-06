@@ -493,7 +493,7 @@ class TaggingSecurity(unittest.TestCase):
     def test_unsupported_harness_and_custom_commands_never_launch(self):
         from unittest.mock import patch
         with patch.object(yt, 'run') as run, patch.object(yt, 'QUIET', True):
-            for harness in ['agy', 'codex', 'opencode']:
+            for harness in ['agy', 'codex', 'opencode', 'gemini']:
                 self.assertEqual(yt.suggest_tags('t', 'c', 'malicious instructions', harness, None, None), [])
             self.assertEqual(yt.suggest_tags('t', 'c', 'b', 'claude', None, 'sh -c malicious'), [])
         run.assert_not_called()
@@ -517,15 +517,13 @@ class TaggingSecurity(unittest.TestCase):
             with patch.object(yt, 'run', side_effect=invoke):
                 self.assertEqual(yt.suggest_tags('t', 'c', 'b', 'claude', None, None), ['security-testing'])
 
-    def test_gemini_has_wildcard_deny_policy_without_trust_bypass(self):
-        import tempfile
+    def test_gemini_fails_closed_even_when_tool_policy_is_available(self):
         from unittest.mock import patch
-        with tempfile.TemporaryDirectory() as directory, patch.object(yt.Path, 'exists', return_value=False):
-            argv = yt.secure_tagging_command(yt.HARNESSES['gemini']['build'](None), 'gemini', directory)
-            self.assertNotIn('--skip-trust', argv)
-            policy = Path(argv[argv.index('--admin-policy') + 1]).read_text()
-            self.assertIn('toolName = "*"', policy)
-            self.assertIn('decision = "deny"', policy)
+        with patch.object(yt, 'run') as run, patch.object(yt, 'QUIET', True):
+            self.assertEqual(yt.suggest_tags('t', 'c', 'b', 'gemini', None, None), [])
+        run.assert_not_called()
+        with self.assertRaises(ValueError):
+            yt.secure_tagging_command(['gemini', '-p'], 'gemini', '/tmp')
 
 
 class TagTimeoutValidation(unittest.TestCase):
