@@ -470,21 +470,62 @@ class SuggestTagsTimeout(unittest.TestCase):
             self.addCleanup(p.stop)
 
     def test_hanging_tagger_is_skipped_after_retries(self):
-        tags = yt.suggest_tags("t", "c", "b", "agy", None, "sleep 30", timeout=0.2)
+        from unittest.mock import patch
+        with patch.object(yt, "run", side_effect=yt.subprocess.TimeoutExpired('claude', 0.2)) as run:
+            tags = yt.suggest_tags("t", "c", "b", "claude", None, None, timeout=0.2)
+        self.assertEqual(run.call_count, yt.TAG_ATTEMPTS)
         self.assertEqual(tags, [])
 
     def test_retry_succeeds_on_second_attempt(self):
-        # Hangs on the first call only: the marker file exists on the second.
-        mark = self.tmp / "ran"
-        script = f"cat >/dev/null; [ -e {mark} ] || {{ touch {mark}; sleep 30; }}; echo ai-tools"
-        tags = yt.suggest_tags("t", "c", "b", "agy", None,
-                               f"sh -c {shlex.quote(script)}", timeout=0.5)
+        from unittest.mock import patch
+        success = yt.subprocess.CompletedProcess(['claude'], 0, 'ai-tools', '')
+        with patch.object(yt, "run", side_effect=[yt.subprocess.TimeoutExpired('claude', 0.5), success]):
+            tags = yt.suggest_tags("t", "c", "b", "claude", None, None, timeout=0.5)
         self.assertEqual(tags, ["ai-tools"])
 
     def test_ctrl_c_skips_tags(self):
         from unittest.mock import patch
         with patch.object(yt, "run", side_effect=KeyboardInterrupt):
-            self.assertEqual(yt.suggest_tags("t", "c", "b", "agy", None, "cat"), [])
+            self.assertEqual(yt.suggest_tags("t", "c", "b", "claude", None, None), [])
+
+
+class TaggingSecurity(unittest.TestCase):
+    def test_unsupported_harness_and_custom_commands_never_launch(self):
+        from unittest.mock import patch
+        with patch.object(yt, 'run') as run, patch.object(yt, 'QUIET', True):
+            for harness in ['agy', 'codex', 'opencode']:
+                self.assertEqual(yt.suggest_tags('t', 'c', 'malicious instructions', harness, None, None), [])
+            self.assertEqual(yt.suggest_tags('t', 'c', 'b', 'claude', None, 'sh -c malicious'), [])
+        run.assert_not_called()
+
+    def test_claude_has_no_tools_and_receives_only_auth_environment(self):
+        import tempfile
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as directory, \
+             patch.object(yt, 'TAG_VOCAB', Path(directory) / 'tags.txt'), \
+             patch.dict(yt.os.environ, {'PATH': '/bin', 'HOME': '/trusted-home',
+                                       'GH_TOKEN': 'unrelated', 'ANTHROPIC_API_KEY': 'test-auth'}, clear=True):
+            def invoke(argv, **kwargs):
+                self.assertEqual(argv[argv.index('--tools') + 1], '')
+                self.assertIn('--safe-mode', argv)
+                self.assertIn('--strict-mcp-config', argv)
+                self.assertNotIn('GH_TOKEN', kwargs['env'])
+                self.assertEqual(kwargs['env']['ANTHROPIC_API_KEY'], 'test-auth')
+                self.assertNotEqual(Path(kwargs['cwd']), Path.cwd())
+                self.assertEqual(list(Path(kwargs['cwd']).iterdir()), [])
+                return yt.subprocess.CompletedProcess(argv, 0, 'security-testing', '')
+            with patch.object(yt, 'run', side_effect=invoke):
+                self.assertEqual(yt.suggest_tags('t', 'c', 'b', 'claude', None, None), ['security-testing'])
+
+    def test_gemini_has_wildcard_deny_policy_without_trust_bypass(self):
+        import tempfile
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as directory, patch.object(yt.Path, 'exists', return_value=False):
+            argv = yt.secure_tagging_command(yt.HARNESSES['gemini']['build'](None), 'gemini', directory)
+            self.assertNotIn('--skip-trust', argv)
+            policy = Path(argv[argv.index('--admin-policy') + 1]).read_text()
+            self.assertIn('toolName = "*"', policy)
+            self.assertIn('decision = "deny"', policy)
 
 
 class TagTimeoutValidation(unittest.TestCase):
@@ -504,4 +545,3 @@ class TagTimeoutValidation(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

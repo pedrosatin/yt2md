@@ -281,3 +281,20 @@ to propose a change or report a problem.
 ## License
 
 MIT
+
+## Tool-free tagging
+
+Tag generation runs in an empty temporary directory with a restricted environment.
+Only transport variables and credentials for the selected provider are forwarded.
+Claude uses `--safe-mode`, an empty tools list and an empty strict MCP configuration.
+Ollama is a text-only inference command. Gemini uses an explicit deny-all admin policy;
+tagging is skipped when central policies could override that restriction. The policy
+syntax follows the [Gemini policy engine reference](https://geminicli.com/docs/reference/policy-engine/).
+
+The configured default and recognized model names are preserved. Tagging through agy,
+Codex, OpenCode and custom commands is skipped because a tool-free mode cannot be
+verified for those adapters. The transcript is still saved. Choose
+`--tag-harness claude`, `--tag-harness ollama`, or `--no-tags`; no provider is selected
+automatically. Unsupported safety flags fail tagging without a permissive retry.
+
+Run offline regressions with `python3 -m unittest -v test_yt2md`.
