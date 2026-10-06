@@ -594,5 +594,306 @@ class TagTimeoutValidation(unittest.TestCase):
             yt.main(["--tag-timeout", "0", "https://youtu.be/x"])
 
 
+
+def frontmatter(doc):
+    head, sep, rest = doc[len("---\n"):].partition("\n---\n\n")
+    assert doc.startswith("---\n") and sep, doc
+    return head.splitlines(), rest
+
+
+FRONTMATTER_KEYS = ["source_url", "type", "title", "author", "captured_at",
+                    "video_id", "subtitle_lang", "tags"]
+
+
+class YtDlpInvocation(unittest.TestCase):
+    def test_command_ignores_config_and_ends_options_before_url(self):
+        cmd = yt.ytdlp_command("https://youtu.be/x", "firefox")
+        self.assertEqual(cmd[0], "yt-dlp")
+        self.assertIn("--ignore-config", cmd)
+        self.assertEqual(cmd[-2:], ["--", "https://youtu.be/x"])
+        self.assertLess(cmd.index("--cookies-from-browser"), cmd.index("--"))
+
+    def test_bare_video_id_is_still_accepted(self):
+        self.assertEqual(yt.ytdlp_command("zcLPGC-tvgk", None)[-2:], ["--", "zcLPGC-tvgk"])
+
+    def test_option_like_arguments_are_rejected(self):
+        for bad in ["--cookies=/tmp/victim.txt", "-a/etc/passwd", " --plugin-dirs=x", "", "  "]:
+            with self.subTest(bad=bad), self.assertRaises(RuntimeError):
+                yt.ytdlp_command(bad, None)
+
+    def test_probe_rejects_option_without_running_ytdlp(self):
+        from unittest.mock import patch
+        with patch.object(yt, "run") as run, self.assertRaises(RuntimeError):
+            yt.probe("--config-locations=/tmp/evil.conf", None)
+        run.assert_not_called()
+
+    def test_probe_runs_in_empty_temporary_directory(self):
+        import os
+        import tempfile
+        from unittest.mock import patch
+        seen = {}
+
+        def invoke(cmd, **kwargs):
+            seen["cmd"], seen["cwd"] = cmd, Path(kwargs["cwd"])
+            seen["listing"] = list(seen["cwd"].iterdir())
+            return yt.subprocess.CompletedProcess(cmd, 0, '{"id": "x"}', "")
+
+        with tempfile.TemporaryDirectory() as work:
+            # A hostile config in the directory the user runs yt2md from.
+            Path(work, "yt-dlp.conf").write_text("--plugin-dirs .plugins\n")
+            old = os.getcwd()
+            os.chdir(work)
+            try:
+                with patch.object(yt, "run", side_effect=invoke):
+                    self.assertEqual(yt.probe("https://youtu.be/x", None), {"id": "x"})
+            finally:
+                os.chdir(old)
+            self.assertNotEqual(seen["cwd"].resolve(), Path(work).resolve())
+        self.assertTrue(seen["cwd"].is_absolute())
+        self.assertEqual(seen["listing"], [])
+        self.assertFalse(seen["cwd"].exists())  # removed after the probe
+        self.assertIn("--ignore-config", seen["cmd"])
+        self.assertEqual(seen["cmd"][-2:], ["--", "https://youtu.be/x"])
+
+
+class OutputFiles(unittest.TestCase):
+    def setUp(self):
+        import tempfile
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.dir = Path(tmp.name)
+
+    def test_existing_file_is_kept_and_suffix_added(self):
+        (self.dir / "Talk.md").write_text("mine")
+        first = yt.write_output(self.dir, "Talk", "new 1")
+        second = yt.write_output(self.dir, "Talk", "new 2")
+        self.assertEqual((self.dir / "Talk.md").read_text(), "mine")
+        self.assertEqual(first.name, "Talk-2.md")
+        self.assertEqual(second.name, "Talk-3.md")
+        self.assertEqual(first.read_text(), "new 1")
+
+    def test_overwrite_flag_restores_old_behavior(self):
+        (self.dir / "Talk.md").write_text("old")
+        dest = yt.write_output(self.dir, "Talk", "new", overwrite=True)
+        self.assertEqual(dest, self.dir.resolve() / "Talk.md")
+        self.assertEqual(dest.read_text(), "new")
+
+    def test_symlink_is_never_followed(self):
+        outside = self.dir / "outside.txt"
+        outside.write_text("secret")
+        out = self.dir / "out"
+        out.mkdir()
+        (out / "Talk.md").symlink_to(outside)
+        self.assertEqual(yt.write_output(out, "Talk", "x").name, "Talk-2.md")
+        with self.assertRaises(RuntimeError):
+            yt.write_output(out, "Talk", "x", overwrite=True)
+        self.assertEqual(outside.read_text(), "secret")
+
+    def test_path_is_absolute_and_inside_outdir(self):
+        import os
+        old = os.getcwd()
+        os.chdir(self.dir)
+        try:
+            dest = yt.write_output("sub", "Talk", "x")
+        finally:
+            os.chdir(old)
+        self.assertTrue(dest.is_absolute())
+        self.assertEqual(dest.parent, (self.dir / "sub").resolve())
+
+    def test_unsafe_names_are_refused(self):
+        for stem in [".hidden", "a/../b"]:
+            with self.subTest(stem=stem), self.assertRaises(RuntimeError):
+                yt.write_output(self.dir, stem, "x")
+
+    def test_reserved_and_hidden_titles_get_the_video_id(self):
+        cases = {"CLAUDE": "CLAUDE-abc_12", "agents": "agents-abc_12", "Readme": "Readme-abc_12",
+                 "CLAUDE.local": "CLAUDE.local-abc_12", "GEMINI.md": "GEMINI.md-abc_12",
+                 "nul": "nul-abc_12", "Claude Code tips": "Claude Code tips"}
+        for title, stem in cases.items():
+            with self.subTest(title=title):
+                self.assertEqual(yt.output_stem(title, "abc_12"), stem)
+        self.assertEqual(yt.output_stem("SKILL", "../x"), "SKILL-x")
+        self.assertEqual(yt.output_stem("README", ""), "README-video")
+        self.assertFalse(yt.output_stem("..bashrc", "id").startswith("."))
+
+
+class ProcessWritesSafely(unittest.TestCase):
+    """End to end through main(), with yt-dlp and the subtitle download mocked."""
+
+    def setUp(self):
+        import tempfile
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.dir = Path(tmp.name)
+
+    def run_main(self, info, *extra):
+        import io
+        from contextlib import redirect_stderr, redirect_stdout
+        from unittest.mock import patch
+        out, err = io.StringIO(), io.StringIO()
+        sub = {"json3": [{"ext": "json3", "url": "https://www.youtube.com/api/timedtext?v=x"}]}
+        info = {"subtitles": {"en": sub["json3"]}, "language": "en", **info}
+        with patch.object(yt, "probe", return_value=info), \
+             patch.object(yt, "fetch", return_value=track(cue(0, 1000, "hello"))), \
+             patch.object(yt, "load_config", return_value={}), \
+             redirect_stdout(out), redirect_stderr(err):
+            rc = yt.main(["--no-tags", "-o", str(self.dir), *extra, "https://youtu.be/x"])
+        return rc, out.getvalue(), err.getvalue()
+
+    def test_title_cannot_replace_agent_instructions(self):
+        (self.dir / "CLAUDE.md").write_text("project rules")
+        rc, out, _ = self.run_main({"title": "CLAUDE", "id": "vid123"}, "--overwrite")
+        self.assertEqual(rc, 0)
+        self.assertEqual((self.dir / "CLAUDE.md").read_text(), "project rules")
+        self.assertTrue((self.dir / "CLAUDE-vid123.md").exists())
+        self.assertIn(str(self.dir.resolve() / "CLAUDE-vid123.md"), out)
+
+    def test_second_run_keeps_first_file(self):
+        self.run_main({"title": "Talk", "id": "v"})
+        (self.dir / "Talk.md").write_text("edited by hand")
+        self.run_main({"title": "Talk", "id": "v"})
+        self.assertEqual((self.dir / "Talk.md").read_text(), "edited by hand")
+        self.assertTrue((self.dir / "Talk-2.md").exists())
+
+    def test_terminal_escapes_never_reach_stderr_file_name_or_markdown(self):
+        title = "T\x1b]0;PWNED-TITLE\x07\x1b[31mRED\r\nnext‮"
+        rc, out, err = self.run_main({"title": title, "uploader": "C\x1b[2J", "id": "v"})
+        self.assertEqual(rc, 0)
+        files = list(self.dir.iterdir())
+        self.assertEqual([f.name for f in files], ["TRED next.md"])
+        doc = files[0].read_text()
+        for text in (err, out, doc):
+            self.assertNotIn("\x1b", text)
+            self.assertNotIn("\x07", text)
+            self.assertNotIn("‮", text)
+        self.assertIn("# TRED next\n", doc)
+
+    def test_option_like_url_fails_cleanly(self):
+        import io
+        from contextlib import redirect_stderr
+        from unittest.mock import patch
+        err = io.StringIO()
+        with patch.object(yt, "run") as run, patch.object(yt, "load_config", return_value={}), \
+             redirect_stderr(err):
+            rc = yt.main(["--no-tags", "-o", str(self.dir), "--", "--cookies=/tmp/x.txt"])
+        self.assertEqual(rc, 1)
+        run.assert_not_called()
+        self.assertIn("not a URL or video ID", err.getvalue())
+
+
+class SubtitleFetch(unittest.TestCase):
+    def test_file_url_is_refused_without_reading(self):
+        import tempfile
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as d:
+            secret = Path(d) / "notes.json3"
+            secret.write_text(track(cue(0, 1000, "local secret")))
+            with patch.object(yt.urllib.request, "build_opener") as opener, \
+                 self.assertRaises(RuntimeError) as ctx:
+                yt.fetch(secret.as_uri())
+            opener.assert_not_called()
+        self.assertIn("only https://", str(ctx.exception))
+
+    def test_only_public_https_hosts_are_accepted(self):
+        refused = ["http://www.youtube.com/api/timedtext", "ftp://example.com/x",
+                   "data:text/plain,hi", "https://localhost/x", "https://a.localhost/x",
+                   "https://127.0.0.1/x", "https://[::1]/x", "https://169.254.169.254/latest",
+                   "https://10.0.0.5/x", "https://192.168.1.1/x", "https://[::ffff:127.0.0.1]/x",
+                   "https:///nohost", "not a url"]
+        for url in refused:
+            with self.subTest(url=url), self.assertRaises(RuntimeError):
+                yt.check_subtitle_url(url)
+        for url in ["https://www.youtube.com/api/timedtext?v=x&fmt=json3",
+                    "https://8.8.8.8/x"]:
+            self.assertEqual(yt.check_subtitle_url(url), url)
+
+    def test_redirect_to_internal_address_is_refused(self):
+        handler = yt._CheckedRedirect()
+        req = yt.urllib.request.Request("https://www.youtube.com/a")
+        with self.assertRaises(RuntimeError):
+            handler.redirect_request(req, None, 302, "Found", {},
+                                     "http://169.254.169.254/latest/meta-data")
+
+    def test_body_size_is_limited(self):
+        import io
+
+        class Resp(io.BytesIO):
+            def __init__(self, data, length=None):
+                super().__init__(data)
+                self.headers = {"Content-Length": length} if length else {}
+
+        self.assertEqual(yt.read_limited(Resp(b"abc"), limit=3), b"abc")
+        with self.assertRaises(RuntimeError):
+            yt.read_limited(Resp(b"abcd"), limit=3)
+        with self.assertRaises(RuntimeError):
+            yt.read_limited(Resp(b"", length="999999999999"), limit=3)
+
+    def test_retry_after_is_bounded(self):
+        self.assertEqual(yt.retry_after({"Retry-After": "5"}, 2.0), 5.0)
+        self.assertEqual(yt.retry_after({"Retry-After": "1e9"}, 2.0), yt.MAX_RETRY_AFTER)
+        for bad in ["inf", "nan", "-3", "0", "Wed, 21 Oct 2015 07:28:00 GMT", "x" * 10000, ""]:
+            with self.subTest(bad=bad[:20]):
+                self.assertEqual(yt.retry_after({"Retry-After": bad}, 2.0), 2.0)
+        self.assertEqual(yt.retry_after(None, 4.0), 4.0)
+
+    def test_fetch_waits_at_most_the_cap(self):
+        import io
+        from email.message import Message
+        from unittest.mock import MagicMock, patch
+        headers = Message()
+        headers["Retry-After"] = "1000000000"
+        busy = yt.urllib.error.HTTPError("https://www.youtube.com/a", 429, "busy", headers, None)
+        resp = MagicMock()
+        resp.__enter__.return_value = resp
+        resp.headers = {}
+        resp.read.side_effect = io.BytesIO(b'{"events": []}').read
+        opener = MagicMock()
+        opener.open.side_effect = [busy, resp]
+        with patch.object(yt.urllib.request, "build_opener", return_value=opener), \
+             patch.object(yt.time, "sleep") as sleep, patch.object(yt, "QUIET", True):
+            self.assertEqual(yt.fetch("https://www.youtube.com/a"), '{"events": []}')
+        self.assertLessEqual(sleep.call_args.args[0], yt.MAX_RETRY_AFTER + 1)
+
+
+class FrontmatterInjection(unittest.TestCase):
+    def test_metadata_cannot_add_keys_or_close_the_block(self):
+        doc = yt.build_document('A "t"\n---\nreviewed: true', "C\nx: 1",
+                                "abc\nreviewed: true", "en\ntags: [owned]",
+                                ["ok-tag", "true", "123", "a, b"], "body")
+        lines, rest = frontmatter(doc)
+        self.assertEqual([l.split(":", 1)[0] for l in lines], FRONTMATTER_KEYS)
+        values = {l.split(":", 1)[0]: l.split(": ", 1)[1] for l in lines}
+        for key in ["source_url", "title", "author", "video_id", "subtitle_lang"]:
+            self.assertTrue(values[key].startswith('"'), key)
+        self.assertEqual(json.loads(values["video_id"]), "abc\nreviewed: true")
+        self.assertEqual(json.loads(values["subtitle_lang"]), "en\ntags: [owned]")
+        self.assertEqual(json.loads(values["title"]), 'A "t"\n---\nreviewed: true')
+        self.assertEqual(values["tags"], '[ok-tag, "true", "123", "a, b"]')
+        self.assertTrue(rest.startswith('# A "t" --- reviewed: true\n\n'))
+
+    def test_frontmatter_round_trips_with_pyyaml(self):
+        try:
+            import yaml
+        except ImportError:
+            self.skipTest("PyYAML not installed")
+        doc = yt.build_document("t x\x85y\x7f", "c", "abc\nreviewed: true",
+                                "en\ntags: [owned]", ["true", "a"], "b")
+        data = yaml.safe_load(doc.split("\n---\n\n")[0][4:])
+        self.assertEqual(set(data), set(FRONTMATTER_KEYS))
+        self.assertEqual(data["video_id"], "abc\nreviewed: true")
+        self.assertEqual(data["subtitle_lang"], "en\ntags: [owned]")
+        self.assertEqual(data["title"], "t x\x85y\x7f")
+        self.assertEqual(data["tags"], ["true", "a"])
+
+    def test_yaml_str_escapes_line_breaks_and_controls(self):
+        self.assertEqual(yt.yaml_str("a\nb\tc\x1b"), "a\\nb\\tc\\u001b")
+        self.assertEqual(yt.yaml_str("x y\x85"), "x\\u2028y\\u0085")
+
+    def test_clean_meta_strips_terminal_escapes(self):
+        self.assertEqual(yt.clean_meta("T\x1b]0;PWNED\x07\x1b[31mRED\x1b[0m"), "TRED")
+        self.assertEqual(yt.clean_meta("a\nb\r\x00c\x9b‮"), "a b c")
+        self.assertEqual(yt.sanitize("x\x1b[31m\x07y"), "xy")
+
+
 if __name__ == "__main__":
     unittest.main()

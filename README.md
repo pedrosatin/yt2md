@@ -18,10 +18,11 @@ yt2md https://youtu.be/zcLPGC-tvgk -o ~/videos
       141 paragraphs, 9987 words
   4/4 generating tags via claude (haiku)...
       ai-agents, code-quality, software-architecture, clean-code (14.2s)
-OK LIVE Uncle Bob on Software Fundamentals in the Age of AI.md
+OK /home/you/videos/LIVE Uncle Bob on Software Fundamentals in the Age of AI.md
 ```
 
-The result is a `<video title>.md` file:
+The result is a `<video title>.md` file (see [Output files](#output-files) for
+what happens when that name is taken):
 
 ```markdown
 ---
@@ -30,8 +31,8 @@ type: video
 title: "LIVE: Uncle Bob on Software Fundamentals in the Age of AI"
 author: "Matt Pocock"
 captured_at: 2026-09-07T20:44:27+00:00
-video_id: zcLPGC-tvgk
-subtitle_lang: en
+video_id: "zcLPGC-tvgk"
+subtitle_lang: "en"
 tags: [ai-agents, code-quality, software-architecture, clean-code]
 ---
 
@@ -195,6 +196,7 @@ yt2md <url> [<url>...] [options]
   -l, --lang LANG           force a language (default: the video's original)
   -o, --outdir DIR          output directory (default: cwd)
       --stdout              print instead of saving
+      --overwrite           replace an existing <title>.md instead of adding -2, -3...
       --keep-timestamps     keep the timestamps
       --keep-sound-tags     keep [Laughter], [Applause], music notes
   -q, --quiet               do not print step progress
@@ -214,6 +216,44 @@ Progress goes to stderr, so `--stdout` stays pipeable:
 ```bash
 yt2md <url> --stdout --no-tags | less
 ```
+
+Arguments that start with `-` after `--` are rejected rather than handed to
+yt-dlp as options. A bare video ID such as `zcLPGC-tvgk` still works.
+
+## Output files
+
+The file is named after the video title, and yt2md never replaces a file that
+is already there:
+
+- If `<title>.md` exists, the transcript is saved as `<title>-2.md`, then
+  `<title>-3.md`, and so on. Pass `--overwrite` to replace `<title>.md`
+  instead. A symlink at that path is never followed: without `--overwrite` the
+  next free name is used, and with it the write fails.
+- Titles that would produce a file other tools read as instructions or project
+  metadata get the video ID appended. `CLAUDE`, `AGENTS`, `GEMINI`, `SKILL`,
+  `README`, `CONTRIBUTING`, `SECURITY`, `CHANGELOG`, `LICENSE` and a few others
+  (any case, and also `CLAUDE.local` and similar) become, for example,
+  `CLAUDE-zcLPGC-tvgk.md`. This applies with `--overwrite` too.
+- The name never starts with `.`, never contains `/` or `\`, and the file is
+  always created directly inside the output directory. The path printed after
+  `OK` is absolute.
+- Escape sequences and control characters in the title and channel are removed
+  before they reach the terminal, the file name or the Markdown. In the
+  frontmatter every text value is a quoted YAML string, so metadata cannot add
+  keys or close the block early.
+
+## Network and yt-dlp
+
+yt2md runs yt-dlp with `--ignore-config`, from an empty temporary directory.
+yt-dlp config files are not read, neither a `yt-dlp.conf` in the directory you
+run yt2md from (which could otherwise load plugins and run code) nor your own
+`~/.config/yt-dlp/config`. Use yt2md's own options, such as
+`--cookies-from-browser`, for the settings it needs.
+
+The subtitle track is downloaded only from an `https://` URL. `file://`,
+`http://` and other schemes are refused, as are `localhost` and IP addresses in
+loopback, private or link-local ranges, including after a redirect. The download
+is capped at 32 MiB, and a `Retry-After` header is honored for at most 60 seconds.
 
 ## What it handles
 
@@ -313,7 +353,7 @@ cost of minutes per video instead of seconds.
 python3 -m unittest -v test_yt2md
 ```
 
-57 offline tests, no network and no LLM.
+82 offline tests, no network and no LLM.
 
 ## Contributing
 
