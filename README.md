@@ -16,7 +16,7 @@ yt2md https://youtu.be/zcLPGC-tvgk -o ~/videos
       1449 cues (0.5s)
   3/4 assembling paragraphs...
       141 paragraphs, 9987 words
-  4/4 generating tags via agy (gemini-3.8-flash-high)...
+  4/4 generating tags via claude (haiku)...
       ai-agents, code-quality, software-architecture, clean-code (14.2s)
 OK LIVE Uncle Bob on Software Fundamentals in the Age of AI.md
 ```
@@ -47,24 +47,23 @@ speak to for a while...
 |---|---|---|
 | **Python 3.9+** | yes | Standard library only - nothing to `pip install`. |
 | **[yt-dlp](https://github.com/yt-dlp/yt-dlp)** | yes | Must be on `PATH`. It is itself a Python program, so Python is already a transitive dependency. |
-| An LLM CLI | optional | Only for `tags:`. Skip it with `--no-tags`. |
+| `claude` or `ollama` | optional | Only for `tags:`. Skip it with `--no-tags`. |
 
-Supported tagging CLIs, via `--tag-harness`:
+Tagging CLIs, via `--tag-harness`:
 
-| Harness | Invocation used | Status |
+| Harness | Invocation used | Tags |
 |---|---|---|
-| `agy` (default) | `agy --model gemini-3.8-flash-high -p <prompt>` | tested |
-| `claude` | `claude -p --model haiku` | tested |
-| `codex` | `codex exec --skip-git-repo-check -` | tested |
-| `opencode` | `opencode run` | tested |
-| `gemini` | `gemini --skip-trust -p <prompt>` | untested (blocked on tier eligibility) |
-| `ollama` | `ollama run <model>` | untested |
+| `claude` | `claude --safe-mode --tools "" --strict-mcp-config --mcp-config '{"mcpServers":{}}' --disable-slash-commands --no-session-persistence -p --model haiku` | generated |
+| `ollama` | `ollama run <model>` | generated |
+| `agy` (default) | not launched | skipped |
+| `codex` | not launched | skipped |
+| `gemini` | not launched | skipped |
+| `opencode` | not launched | skipped |
+| `--tagger` command | not launched | skipped |
 
-Anything else works through `--tagger`, which receives the prompt on stdin:
-
-```bash
-yt2md <url> --tagger "llm -m gpt-4o-mini"
-```
+Only Claude and Ollama run, because only they can be started without tools.
+See [Tool-free tagging](#tool-free-tagging) for the reason and for what the
+CLI receives.
 
 ## Setup
 
@@ -135,31 +134,36 @@ touching an LLM. If it prints Markdown, the setup is done.
 
 ### 5. Tagging (optional)
 
-`tags:` needs one of the LLM CLIs listed under [Dependencies](#dependencies) on
-your `PATH`. The default is `agy` (with `gemini-3.8-flash-high`):
+`tags:` needs `claude` or `ollama` on your `PATH`. The default harness is still
+`agy`, and with it tags are skipped: yt2md prints a warning and saves the file
+with `tags: []`. Pick a harness that generates tags:
 
 ```bash
-agy --version                  # already installed? nothing else to do
-yt2md <url> -o ~/videos        # tags come from agy --model gemini-3.8-flash-high -p
+claude --version
+yt2md --set-harness claude     # or: yt2md --set-harness ollama --set-model llama3.2
+yt2md <url> -o ~/videos
 ```
+
+Or turn tagging off with `--no-tags`.
 
 #### Changing the default agent
 
-You can change the default agent in any of these ways:
+You can change the default agent in any of these ways. Only `claude` and
+`ollama` generate tags; the other names are accepted, but tagging is skipped
+with them.
 
 1. **Persistently via CLI:**
    ```bash
    yt2md --set-harness claude                     # switch default harness to claude
-   yt2md --set-harness agy --set-model gemini-3.8-flash    # normalizes to gemini-3.8-flash-high
+   yt2md --set-harness ollama --set-model llama3.2
    yt2md --show-config                            # inspect current effective defaults
    ```
-   *(Note: For `agy`, Gemini models without explicit effort suffix are automatically normalized to `-high`.)*
 
 2. **Via config file (`~/.config/yt2md/config.json`):**
    ```json
    {
-     "tag_harness": "agy",
-     "tag_model": "gemini-3.8-flash-high",
+     "tag_harness": "claude",
+     "tag_model": "haiku",
      "tag_timeout": 60
    }
    ```
@@ -172,12 +176,13 @@ You can change the default agent in any of these ways:
 
 4. **Per invocation:**
    ```bash
-   yt2md <url> --tag-harness codex
+   yt2md <url> --tag-harness claude
    yt2md <url> --tag-harness ollama --tag-model llama3.2
    ```
 
 No LLM CLI at all? Use `--no-tags` and the file is written with `tags: []`.
 A tagging failure never loses the transcript - it warns and saves anyway.
+The warning for a skipped harness is printed even with `-q`.
 A tagger that hangs is killed after `--tag-timeout` seconds (60 by default) and
 retried once. Ctrl+C during tagging skips the tags for that video and still
 saves the file.
@@ -194,9 +199,9 @@ yt2md <url> [<url>...] [options]
       --keep-sound-tags     keep [Laughter], [Applause], music notes
   -q, --quiet               do not print step progress
       --no-tags             skip tag generation (avoids the LLM call)
-      --tag-harness NAME    agy | claude | codex | gemini | ollama | opencode
+      --tag-harness NAME    claude | ollama generate tags; agy | codex | gemini | opencode skip them
       --tag-model MODEL     model for tagging
-      --tagger COMMAND      custom tagging command, prompt on stdin
+      --tagger COMMAND      custom tagging command; tagging is skipped when set
       --tag-timeout SECONDS seconds per tagging attempt (default: 60, 2 attempts)
       --cookies-from-browser BROWSER
       --show-config         show current defaults and available harnesses
@@ -246,6 +251,44 @@ a synonym. Without this you end up with `tdd`, `test-driven-development` and
 
 The vocabulary is a plain text file - edit it freely.
 
+## Tool-free tagging
+
+Tagging sends the video title, channel and transcript to an LLM CLI. That text
+comes from third parties, so it could contain instructions aimed at the model.
+yt2md only launches a CLI that cannot act on them: one started without tools,
+file access or commands.
+
+- Claude runs with `--safe-mode` (no CLAUDE.md, skills, plugins or hooks), an
+  empty tools list, an empty strict MCP configuration, slash commands disabled
+  and no session saved.
+- Ollama's `ollama run` only generates text.
+- agy, Codex, Gemini, OpenCode and `--tagger` commands are not launched. None of
+  them has a mode where tools and startup hooks can be turned off with
+  certainty. Gemini, for example, still runs global hooks and extensions when
+  tools are denied.
+
+Your configured harness is not changed; if it is not Claude or Ollama, tags are
+skipped and the transcript is saved with `tags: []`.
+
+The CLI runs in an empty temporary directory and gets a reduced environment:
+`PATH`, `HOME`, `USER`, `LANG`, `LC_ALL`, `TMPDIR`, the proxy variables
+(`HTTPS_PROXY`, `HTTP_PROXY`, `NO_PROXY`, upper or lower case), the CA
+variables (`SSL_CERT_FILE`, `SSL_CERT_DIR`, `NODE_EXTRA_CA_CERTS`), plus the
+selected provider's settings:
+
+- Claude: `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `CLAUDE_CODE_OAUTH_TOKEN`,
+  `ANTHROPIC_BASE_URL`, `CLAUDE_CONFIG_DIR`, and the Bedrock and Vertex
+  variables (`CLAUDE_CODE_USE_BEDROCK`, `CLAUDE_CODE_USE_VERTEX`, `AWS_REGION`,
+  `AWS_PROFILE`, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`,
+  `AWS_SESSION_TOKEN`, `ANTHROPIC_VERTEX_PROJECT_ID`, `CLOUD_ML_REGION`,
+  `GOOGLE_APPLICATION_CREDENTIALS`).
+- Ollama: `OLLAMA_HOST`, `OLLAMA_API_KEY`.
+
+Everything else, such as tokens for other services, is dropped.
+
+If your Claude CLI is too old to accept these flags, tagging is skipped; yt2md
+never retries without them.
+
 ## Knowledge base
 
 The frontmatter matches what [graphify](https://github.com/safishamsi/graphify) reads: it
@@ -270,7 +313,7 @@ cost of minutes per video instead of seconds.
 python3 -m unittest -v test_yt2md
 ```
 
-27 offline tests, no network and no LLM.
+57 offline tests, no network and no LLM.
 
 ## Contributing
 

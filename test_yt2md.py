@@ -5,7 +5,6 @@ Run with:  python3 -m unittest -v test_yt2md
 """
 
 import json
-import shlex
 import unittest
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
@@ -470,21 +469,114 @@ class SuggestTagsTimeout(unittest.TestCase):
             self.addCleanup(p.stop)
 
     def test_hanging_tagger_is_skipped_after_retries(self):
-        tags = yt.suggest_tags("t", "c", "b", "agy", None, "sleep 30", timeout=0.2)
+        from unittest.mock import patch
+        with patch.object(yt, "run", side_effect=yt.subprocess.TimeoutExpired("claude", 0.2)) as run:
+            tags = yt.suggest_tags("t", "c", "b", "claude", None, None, timeout=0.2)
+        self.assertEqual(run.call_count, yt.TAG_ATTEMPTS)
         self.assertEqual(tags, [])
 
     def test_retry_succeeds_on_second_attempt(self):
-        # Hangs on the first call only: the marker file exists on the second.
-        mark = self.tmp / "ran"
-        script = f"cat >/dev/null; [ -e {mark} ] || {{ touch {mark}; sleep 30; }}; echo ai-tools"
-        tags = yt.suggest_tags("t", "c", "b", "agy", None,
-                               f"sh -c {shlex.quote(script)}", timeout=0.5)
+        from unittest.mock import patch
+        success = yt.subprocess.CompletedProcess(["claude"], 0, "ai-tools", "")
+        with patch.object(yt, "run", side_effect=[yt.subprocess.TimeoutExpired("claude", 0.5), success]) as run:
+            tags = yt.suggest_tags("t", "c", "b", "claude", None, None, timeout=0.5)
         self.assertEqual(tags, ["ai-tools"])
+        # The retry keeps the restricted flags, directory and environment.
+        first, second = run.call_args_list
+        self.assertEqual(first.args, second.args)
+        self.assertEqual(first.kwargs, second.kwargs)
+        self.assertIn("--safe-mode", second.args[0])
+        self.assertTrue(Path(second.kwargs["cwd"]).name.startswith("yt2md-tags-"))
+        self.assertNotIn("GH_TOKEN", second.kwargs["env"])
 
     def test_ctrl_c_skips_tags(self):
         from unittest.mock import patch
         with patch.object(yt, "run", side_effect=KeyboardInterrupt):
-            self.assertEqual(yt.suggest_tags("t", "c", "b", "agy", None, "cat"), [])
+            self.assertEqual(yt.suggest_tags("t", "c", "b", "claude", None, None), [])
+
+
+class TaggingSecurity(unittest.TestCase):
+    def setUp(self):
+        import tempfile
+        from unittest.mock import patch
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        for p in (patch.object(yt, "QUIET", True),
+                  patch.object(yt, "TAG_VOCAB", Path(tmp.name) / "tags.txt")):
+            p.start()
+            self.addCleanup(p.stop)
+
+    def test_unsupported_harness_and_custom_commands_never_launch(self):
+        import io
+        from contextlib import redirect_stderr
+        from unittest.mock import patch
+        err = io.StringIO()
+        with patch.object(yt, "run") as run, redirect_stderr(err):
+            for harness in ["agy", "codex", "opencode", "gemini"]:
+                self.assertEqual(yt.suggest_tags("t", "c", "malicious instructions", harness, None, None), [])
+            self.assertEqual(yt.suggest_tags("t", "c", "b", "claude", None, "sh -c malicious"), [])
+        run.assert_not_called()
+        # The skip changes the output, so it is reported even under --quiet.
+        self.assertIn("tags skipped: gemini has no verified tool-free mode", err.getvalue())
+        self.assertIn("tags skipped: custom tagger", err.getvalue())
+
+    def test_skip_reason_only_allows_claude_and_ollama(self):
+        self.assertIsNone(yt.tag_skip_reason("claude", None))
+        self.assertIsNone(yt.tag_skip_reason("ollama", None))
+        self.assertIsNotNone(yt.tag_skip_reason("claude", "llm -m x"))
+        for harness in ["agy", "codex", "opencode", "gemini"]:
+            self.assertIsNotNone(yt.tag_skip_reason(harness, None))
+
+    def test_claude_has_no_tools_and_receives_only_auth_environment(self):
+        from unittest.mock import patch
+        with patch.dict(yt.os.environ, {"PATH": "/bin", "HOME": "/trusted-home",
+                                        "GH_TOKEN": "unrelated", "ANTHROPIC_API_KEY": "test-auth"}, clear=True):
+            def invoke(argv, **kwargs):
+                self.assertEqual(argv[argv.index("--tools") + 1], "")
+                self.assertIn("--safe-mode", argv)
+                self.assertIn("--strict-mcp-config", argv)
+                self.assertNotIn("GH_TOKEN", kwargs["env"])
+                self.assertEqual(kwargs["env"]["ANTHROPIC_API_KEY"], "test-auth")
+                self.assertNotEqual(Path(kwargs["cwd"]), Path.cwd())
+                self.assertEqual(list(Path(kwargs["cwd"]).iterdir()), [])
+                return yt.subprocess.CompletedProcess(argv, 0, "security-testing", "")
+            with patch.object(yt, "run", side_effect=invoke):
+                self.assertEqual(yt.suggest_tags("t", "c", "b", "claude", None, None), ["security-testing"])
+
+    def test_ollama_runs_text_only_in_empty_directory_with_ollama_environment(self):
+        from unittest.mock import patch
+        with patch.dict(yt.os.environ, {"PATH": "/bin", "HOME": "/trusted-home", "GH_TOKEN": "unrelated",
+                                        "ANTHROPIC_API_KEY": "other-provider",
+                                        "OLLAMA_HOST": "http://127.0.0.1:11434"}, clear=True):
+            def invoke(argv, **kwargs):
+                self.assertEqual(argv, ["ollama", "run", "llama3.2"])
+                self.assertIn("Title: t", kwargs["input"])
+                self.assertEqual(kwargs["env"], {"PATH": "/bin", "HOME": "/trusted-home",
+                                                 "OLLAMA_HOST": "http://127.0.0.1:11434"})
+                self.assertNotEqual(Path(kwargs["cwd"]), Path.cwd())
+                self.assertEqual(list(Path(kwargs["cwd"]).iterdir()), [])
+                return yt.subprocess.CompletedProcess(argv, 0, "local-models", "")
+            with patch.object(yt, "run", side_effect=invoke):
+                self.assertEqual(yt.suggest_tags("t", "c", "b", "ollama", "llama3.2", None), ["local-models"])
+
+    def test_environment_forwards_proxy_ca_and_claude_backends(self):
+        from unittest.mock import patch
+        forwarded = {
+            "HTTPS_PROXY": "http://proxy:3128", "HTTP_PROXY": "http://proxy:3128", "NO_PROXY": "localhost",
+            "https_proxy": "http://proxy:3128", "http_proxy": "http://proxy:3128", "no_proxy": "localhost",
+            "NODE_EXTRA_CA_CERTS": "/etc/ca.pem", "SSL_CERT_FILE": "/etc/ssl.pem",
+        }
+        claude_only = {
+            "CLAUDE_CONFIG_DIR": "/home/u/.claude-work",
+            "CLAUDE_CODE_USE_BEDROCK": "1", "CLAUDE_CODE_USE_VERTEX": "1",
+            "AWS_REGION": "us-east-1", "AWS_PROFILE": "work", "AWS_ACCESS_KEY_ID": "id",
+            "AWS_SECRET_ACCESS_KEY": "secret", "AWS_SESSION_TOKEN": "session",
+            "ANTHROPIC_VERTEX_PROJECT_ID": "project", "CLOUD_ML_REGION": "us-east5",
+            "GOOGLE_APPLICATION_CREDENTIALS": "/home/u/gcp.json",
+        }
+        with patch.dict(yt.os.environ, {**forwarded, **claude_only, "GH_TOKEN": "unrelated"}, clear=True):
+            self.assertEqual(yt.tagging_environment("claude"), {**forwarded, **claude_only})
+            self.assertEqual(yt.tagging_environment("ollama"), forwarded)
 
 
 class TagTimeoutValidation(unittest.TestCase):
@@ -504,4 +596,3 @@ class TagTimeoutValidation(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-
