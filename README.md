@@ -196,7 +196,7 @@ yt2md <url> [<url>...] [options]
   -l, --lang LANG           force a language (default: the video's original)
   -o, --outdir DIR          output directory (default: cwd)
       --stdout              print instead of saving
-      --overwrite           replace an existing <title>.md instead of adding -2, -3...
+      --overwrite           always replace <title>.md instead of adding -2, -3...
       --keep-timestamps     keep the timestamps
       --keep-sound-tags     keep [Laughter], [Applause], music notes
   -q, --quiet               do not print step progress
@@ -217,23 +217,37 @@ Progress goes to stderr, so `--stdout` stays pipeable:
 yt2md <url> --stdout --no-tags | less
 ```
 
-Arguments that start with `-` after `--` are rejected rather than handed to
-yt-dlp as options. A bare video ID such as `zcLPGC-tvgk` still works.
+yt2md passes each URL to yt-dlp after yt-dlp's own `--`, so it is never read as
+an option. Any URL argument that starts with `-` is rejected before yt-dlp
+starts, unless it is an 11-character video ID. A bare video ID such as
+`zcLPGC-tvgk` works. For an ID that starts with `-`, put yt2md's `--` before
+it so its own option parser accepts it: `yt2md -- -wtIMTCHWuI`.
 
 ## Output files
 
-The file is named after the video title, and yt2md never replaces a file that
-is already there:
+The file is named after the video title, and yt2md only replaces a file it
+wrote for the same video:
 
-- If `<title>.md` exists, the transcript is saved as `<title>-2.md`, then
-  `<title>-3.md`, and so on. Pass `--overwrite` to replace `<title>.md`
-  instead. A symlink at that path is never followed: without `--overwrite` the
-  next free name is used, and with it the write fails.
+- If `<title>.md` exists and its frontmatter has the same `video_id`, running
+  yt2md again on that video updates it. The new file is written next to it and
+  then moved into place, so a failed run leaves the old one intact.
+- If `<title>.md` belongs to another video or was not written by yt2md, the
+  transcript is saved as `<title>-2.md`, then `<title>-3.md`, and so on. A
+  `-2`, `-3` file of the same video is updated the same way.
+- Pass `--overwrite` to always replace `<title>.md`. A symlink, FIFO or other
+  non-regular file at that path is never written through: without
+  `--overwrite` the next free name is used, and with it the write fails.
+- The name is cut to 200 bytes of UTF-8 before `-2` and `.md`, without
+  splitting a character, so long titles in Japanese or full of emoji still fit
+  the 255-byte limit of most file systems.
 - Titles that would produce a file other tools read as instructions or project
-  metadata get the video ID appended. `CLAUDE`, `AGENTS`, `GEMINI`, `SKILL`,
-  `README`, `CONTRIBUTING`, `SECURITY`, `CHANGELOG`, `LICENSE` and a few others
-  (any case, and also `CLAUDE.local` and similar) become, for example,
-  `CLAUDE-zcLPGC-tvgk.md`. This applies with `--overwrite` too.
+  metadata get the video ID appended. The reserved names are `AGENTS`, `AGENT`,
+  `CLAUDE`, `GEMINI`, `COPILOT-INSTRUCTIONS`, `CONVENTIONS`, `CRUSH`, `QWEN`,
+  `WARP`, `SKILL`, `README`, `CONTRIBUTING`, `SECURITY`, `CHANGELOG`, `LICENSE`,
+  `CODE_OF_CONDUCT` and the Windows device names `CON`, `PRN`, `AUX`, `NUL`,
+  `CONIN$`, `CONOUT$`, `COM0` to `COM9` and `LPT0` to `LPT9`. Any case counts,
+  and so does a name followed by a dot, such as `CLAUDE.local`. `CLAUDE` becomes,
+  for example, `CLAUDE-zcLPGC-tvgk.md`. This applies with `--overwrite` too.
 - The name never starts with `.`, never contains `/` or `\`, and the file is
   always created directly inside the output directory. The path printed after
   `OK` is absolute.
@@ -244,16 +258,23 @@ is already there:
 
 ## Network and yt-dlp
 
-yt2md runs yt-dlp with `--ignore-config`, from an empty temporary directory.
-yt-dlp config files are not read, neither a `yt-dlp.conf` in the directory you
-run yt2md from (which could otherwise load plugins and run code) nor your own
-`~/.config/yt-dlp/config`. Use yt2md's own options, such as
-`--cookies-from-browser`, for the settings it needs.
+yt2md runs yt-dlp from an empty temporary directory, so a `yt-dlp.conf` or a
+plugin folder in the directory you run yt2md from is never read. Such a file
+could otherwise load plugins and run code when you use yt2md inside a downloaded
+folder or a cloned repository. Your own `~/.config/yt-dlp/config` and the system
+config are still read, so settings such as a proxy or extractor arguments keep
+working.
 
 The subtitle track is downloaded only from an `https://` URL. `file://`,
-`http://` and other schemes are refused, as are `localhost` and IP addresses in
-loopback, private or link-local ranges, including after a redirect. The download
-is capped at 32 MiB, and a `Retry-After` header is honored for at most 60 seconds.
+`http://` and other schemes are refused. The host in the URL is checked, also
+after each redirect: `localhost` and names ending in `.localhost` are refused,
+and so is an IP address outside the public ranges (loopback, private,
+link-local and similar). That covers IPv4 written as a number or in
+octal or hex (`2130706433`, `0x7f000001`, `127.1`, `0177.0.0.1`), IPv4-mapped
+IPv6 and NAT64 addresses (`64:ff9b::/96`). Host names are not resolved, so a
+name that points at an internal address is not caught by this check; the
+`https://` certificate check still has to pass for that name. The download is
+capped at 32 MiB, and a `Retry-After` header is honored for at most 60 seconds.
 
 ## What it handles
 
